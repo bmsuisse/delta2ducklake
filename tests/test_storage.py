@@ -1,3 +1,5 @@
+import pytest
+
 from delta2ducklake.storage import (
     AzureStorageBackend,
     LocalStorageBackend,
@@ -22,11 +24,8 @@ def test_local_backend_read_range(tmp_path):
 
 def test_local_backend_missing_file_raises_storage_error(tmp_path):
     backend = LocalStorageBackend()
-    try:
+    with pytest.raises(StorageError):
         backend.read_bytes(str(tmp_path / "nope.txt"))
-        assert False, "expected StorageError"
-    except StorageError:
-        pass
 
 
 def test_local_backend_list_dir(tmp_path):

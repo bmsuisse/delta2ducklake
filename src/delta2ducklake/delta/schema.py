@@ -7,7 +7,6 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Union
 
 
 @dataclass(frozen=True)
@@ -17,21 +16,21 @@ class PrimitiveType:
 
 @dataclass(frozen=True)
 class ArrayType:
-    element_type: "DeltaType"
+    element_type: DeltaType
     contains_null: bool = True
 
 
 @dataclass(frozen=True)
 class MapType:
-    key_type: "DeltaType"
-    value_type: "DeltaType"
+    key_type: DeltaType
+    value_type: DeltaType
     value_contains_null: bool = True
 
 
 @dataclass(frozen=True)
 class StructField:
     name: str
-    type: "DeltaType"
+    type: DeltaType
     nullable: bool = True
     physical_name: str | None = None
     column_mapping_id: int | None = None
@@ -43,7 +42,7 @@ class StructType:
     fields: tuple[StructField, ...]
 
 
-DeltaType = Union[PrimitiveType, ArrayType, MapType, StructType]
+DeltaType = PrimitiveType | ArrayType | MapType | StructType
 
 
 def parse_schema_string(schema_string: str) -> StructType:
