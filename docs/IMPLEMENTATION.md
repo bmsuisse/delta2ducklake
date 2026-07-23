@@ -599,3 +599,15 @@ DML support, not a bug in this package. Shipped anyway (per explicit decision): 
 and read-only queries already work today, and this should start working for writes with no code
 changes here once Quack gains `UPDATE`/`DELETE` support. Documented prominently in both classes'
 docstrings and in the README so users don't discover this the hard way.
+
+## `sync_table()` now creates the table if it doesn't exist
+
+Previously `sync_table()` raised `ValueError` if `table_name` wasn't already registered, requiring
+callers to know in advance whether a first `copy_table()` call had happened (awkward for a
+recurring job that just wants "make sure this table reflects the Delta table's current state,
+whatever the starting point"). Now, if `find_table_id()` comes back `None`, `sync_table()` rolls
+back its (so-far read-only) connection and delegates to `copy_table()` instead of raising -- safe
+because nothing has been written yet at that point in the function, so handing off to a second,
+independently-connected `copy_table()` call has no partial-state cleanup to worry about.
+`copy_table()` itself is unchanged and still raises if the table already exists, for callers that
+specifically want that hard failure instead of an update.

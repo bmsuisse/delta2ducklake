@@ -205,10 +205,26 @@ def test_sync_table_is_noop_when_nothing_changed(tmp_path):
     assert after_snapshot_count == before_snapshot_count
 
 
-def test_sync_table_raises_if_table_missing(tmp_path):
+def test_sync_table_creates_table_if_missing(tmp_path):
+    """sync_table() is safe to call unconditionally, whether or not copy_table() ran before --
+    a missing table is created (via copy_table()) instead of raising."""
     config = _fresh_catalog(tmp_path)
-    with pytest.raises(ValueError, match="does not exist"):
-        sync_table(str(FIXTURES / "parquet-all-types"), config, "nope")
+    table_root = str(FIXTURES / "parquet-all-types")
+
+    table_id = sync_table(table_root, config, "all_types")
+
+    backend = config.connect()
+    try:
+        (record_count,) = backend.fetchone(
+            "SELECT record_count FROM ducklake_table_stats WHERE table_id = ?", (table_id,)
+        )
+        assert record_count == 200
+    finally:
+        backend.close()
+
+    # Calling sync_table() again on the now-existing table is a genuine sync, not another create.
+    second_table_id = sync_table(table_root, config, "all_types")
+    assert second_table_id == table_id
 
 
 def test_sync_table_detects_path_removed_and_readded_in_place(tmp_path):

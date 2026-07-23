@@ -4,7 +4,7 @@ Register a [Delta Lake](https://delta.io) table into a [DuckLake](https://duckla
 **without copying or rewriting the underlying Parquet files**. Reads the Delta transaction log
 directly (JSON commits + checkpoints), no dependency on the `deltalake` Python package.
 
-Status: early development, not yet published to PyPI.
+Status: beta. Published on [PyPI](https://pypi.org/project/delta2ducklake/).
 
 ## Supported
 
@@ -28,33 +28,32 @@ assistants pick up correct usage automatically once this package is a project de
 
 ## Install
 
-Not yet on PyPI — for now, install from a local clone:
-
 ```bash
-uv add /path/to/delta2ducklake          # or: pip install /path/to/delta2ducklake
-uv add "delta2ducklake[azure]" ...       # if your Delta table or catalog lives on Azure
+uv add delta2ducklake
+uv add "delta2ducklake[azure]"      # if your Delta table or Postgres catalog lives on Azure
 ```
 
 ## Quick start
 
-A DuckLake catalog needs to be **bootstrapped** once (creates its metadata schema), then tables
-are registered into it with `copy_table()` and kept up to date with `sync_table()`. The simplest
-catalog is a local DuckDB database file — DuckLake's own native format:
+A DuckLake catalog needs to be **bootstrapped** once (creates its metadata schema), then tables are
+registered into it and kept up to date with `sync_table()` — it creates the table on first call and
+updates it on every call after, so it's safe to call unconditionally (e.g. from a recurring job).
+The simplest catalog is a local DuckDB database file — DuckLake's own native format:
 
 ```python
 from delta2ducklake.ducklake.bootstrap import bootstrap_catalog
 from delta2ducklake.ducklake.catalog import DuckDBCatalogConfig
-from delta2ducklake.convert import copy_table, sync_table
+from delta2ducklake.convert import sync_table
 
 catalog = DuckDBCatalogConfig("/abs/path/to/catalog.ducklake")
 bootstrap_catalog(catalog, data_path="/abs/path/to/ducklake_data/")  # one-time; safe to re-run
 
-# Register a Delta table's current state as a new DuckLake table.
-copy_table("/path/to/my_delta_table", catalog, "my_table")
-
-# ... later, after the Delta table has new commits ...
+# Registers "my_table" if it doesn't exist yet, or brings it up to date if it does.
 sync_table("/path/to/my_delta_table", catalog, "my_table")
 ```
+
+Use `copy_table()` instead if you specifically want a hard failure when the table already exists,
+rather than an update.
 
 `DuckDBCatalogConfig` also accepts an already-open `duckdb.DuckDBPyConnection` instead of a path
 (e.g. for in-memory testing, or when you already manage a connection to the catalog file) —

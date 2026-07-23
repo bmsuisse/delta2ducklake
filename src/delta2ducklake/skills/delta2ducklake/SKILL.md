@@ -21,9 +21,12 @@ deletion vectors, Hive-style partitioning, and table/file statistics.
 
 Two entry points cover the whole lifecycle:
 
-- `copy_table(...)` — register a Delta table's current state as a brand-new DuckLake table.
-- `sync_table(...)` — bring an already-registered table up to the Delta table's current state
-  (adds new files, retires removed ones, evolves the schema if needed).
+- `copy_table(...)` — register a Delta table's current state as a brand-new DuckLake table; raises
+  if the table name already exists.
+- `sync_table(...)` — bring a table up to the Delta table's current state (adds new files, retires
+  removed ones); creates the table via `copy_table` first if it doesn't exist yet, so it's safe to
+  call unconditionally. Raises `NotImplementedError` if the Delta table's schema changed since it
+  was registered — schema evolution during sync isn't supported yet.
 
 Neither ever touches the Delta table's own files or `_delta_log` — only the DuckLake catalog is
 written to.
@@ -43,8 +46,11 @@ uv add "delta2ducklake[azure]"   # only if the Delta table or a Postgres catalog
   catalog to the exact `DATA_PATH` it was first bootstrapped with. Always pass **absolute paths**;
   a relative path resolves differently depending on the current working directory and will
   spuriously conflict across different callers (cron job vs. shell vs. CI).
-- **`copy_table` is for first-time registration, `sync_table` is for everything after.** Calling
-  `copy_table` again on a table name that already exists raises rather than silently overwriting.
+- **Prefer `sync_table` for anything that might run more than once** — it creates the table (via
+  `copy_table`) if it doesn't exist yet, then updates it on every later call, so it's safe to call
+  unconditionally (e.g. from a recurring job) without checking whether a prior run already
+  registered the table. Reach for `copy_table` directly only when the caller specifically wants a
+  hard failure if the table already exists — it raises rather than silently overwriting.
 - **Never hand-roll delta log parsing or catalog SQL** — always go through `copy_table`/
   `sync_table`/`refresh_stats`/`bootstrap_catalog`. There's no supported lower-level API.
 - **Don't add `deltalake` (the Python package) as a dependency to reach for instead of this
@@ -138,7 +144,8 @@ delta2ducklake refresh-stats --catalog duckdb:./catalog.ducklake --table my_tabl
 
 - [ ] `bootstrap_catalog()` called once, with an **absolute** `data_path`, before any copy/sync
 - [ ] Every later `bootstrap_catalog()`/ATTACH for the same catalog uses the identical `data_path`
-- [ ] `copy_table` used only for a table's first registration; `sync_table` for every update after
+- [ ] `sync_table` used for anything that might run more than once (safe unconditionally); `copy_table`
+      reached for directly only when a hard failure on an already-existing table is wanted
 - [ ] Not reaching for the `deltalake` Python package as a workaround — if something's missing,
       it belongs in delta2ducklake
 - [ ] Quack (`QuackCatalogConfig`) not used for `copy_table`/`sync_table` — bootstrap/read-only only

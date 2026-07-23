@@ -231,11 +231,13 @@ def sync_table(
     schema_name: str = "main",
     end_version: int | None = None,
 ) -> int:
-    """Bring a DuckLake table (previously created by `copy_table()`) up to date with the Delta
-    table's currently-active files (or its state as of `end_version`): newly-added files are
-    registered, files no longer active are retired (their `ducklake_data_file.end_snapshot` set),
-    and table-level stats/record counts are updated incrementally on top of what's already there.
-    A no-op (no new snapshot) if nothing changed. Returns the table_id.
+    """Bring a DuckLake table up to date with the Delta table's currently-active files (or its
+    state as of `end_version`): newly-added files are registered, files no longer active are
+    retired (their `ducklake_data_file.end_snapshot` set), and table-level stats/record counts are
+    updated incrementally on top of what's already there. A no-op (no new snapshot) if nothing
+    changed. If `table_name` doesn't exist yet in `schema_name`, this creates it via `copy_table()`
+    instead of failing -- sync_table() is safe to call unconditionally, whether or not a previous
+    copy_table()/sync_table() call has happened. Returns the table_id.
 
     Raises `NotImplementedError` if the Delta table's schema has changed since it was registered --
     schema evolution during sync is not yet supported.
@@ -258,8 +260,12 @@ def sync_table(
             raise ValueError(f"DuckLake schema {schema_name!r} does not exist")
         table_id = w.find_table_id(catalog, schema_id, table_name, snapshot.snapshot_id)
         if table_id is None:
-            raise ValueError(
-                f"Table {schema_name}.{table_name} does not exist; call copy_table() first"
+            # Nothing written yet on this connection -- safe to hand off to a fresh copy_table()
+            # call/connection instead of failing.
+            catalog.rollback()
+            return copy_table(
+                delta_table_root, catalog_config, table_name,
+                schema_name=schema_name, end_version=end_version,
             )
 
         bookkeeping = _read_bookkeeping(catalog, table_id)

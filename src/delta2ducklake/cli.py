@@ -115,7 +115,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     sync_parser = subparsers.add_parser(
         "sync",
-        help="Update a DuckLake table (from a previous 'copy') to the Delta table's current state",
+        help="Update a DuckLake table to the Delta table's current state "
+        "(creates it via 'copy' if it doesn't exist yet)",
     )
     sync_parser.add_argument(
         "delta_table_root", help="Path/URL to the Delta table's root directory"
