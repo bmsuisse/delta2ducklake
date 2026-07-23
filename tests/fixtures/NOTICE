@@ -1,0 +1,71 @@
+Vendored test fixtures — provenance
+====================================
+
+The Delta Lake table fixtures under this directory are copied verbatim (including their
+_delta_log directories, checkpoint files, and Parquet data files) from the upstream projects
+below, both licensed Apache License 2.0 (full text in licenses/). They are used exclusively as
+test data to verify delta2ducklake's Delta log parsing and conversion logic; no source code was
+copied.
+
+delta-io/delta
+--------------
+Repository: https://github.com/delta-io/delta
+Commit:     0b74571e1fd5df480a27f71defc0333b8e81e01a
+Source path: connectors/golden-tables/src/main/resources/golden/
+License:    licenses/delta-io-delta-LICENSE.txt
+
+Vendored directories (tests/fixtures/delta-io/<name>):
+  basic-with-inserts-deletes-checkpoint
+  checkpoint
+  data-reader-array-complex-objects
+  data-reader-array-primitives
+  data-reader-date-types-America
+  data-reader-date-types-Asia
+  data-reader-date-types-Etc
+  data-reader-date-types-Iceland
+  data-reader-date-types-JST
+  data-reader-date-types-PST
+  data-reader-date-types-UTC
+  data-reader-map
+  data-reader-nested-struct
+  data-reader-partition-values
+  data-reader-primitives
+  data-reader-timestamp_ntz-id-mode
+  data-reader-timestamp_ntz-name-mode
+  data-skipping-basic-stats-all-types
+  data-skipping-basic-stats-all-types-checkpoint
+  data-skipping-basic-stats-all-types-columnmapping-id
+  data-skipping-basic-stats-all-types-columnmapping-name
+  decimal-various-scale-precision
+  delete-re-add-same-file-different-transactions
+  dv-partitioned-with-checkpoint
+  dv-with-columnmapping
+  log-replay-dv-key-cases
+  multi-part-checkpoint
+  parquet-all-types
+  snapshot-data0
+  snapshot-data1
+  snapshot-data2
+  snapshot-data3
+  table-with-columnmapping-mode-id
+  table-with-columnmapping-mode-name
+  time-travel-schema-changes-a
+  time-travel-schema-changes-b
+  v2-checkpoint-json
+  v2-checkpoint-parquet
+
+delta-io/delta-rs
+-----------------
+Repository: https://github.com/delta-io/delta-rs
+Commit:     3f562682c5a9dd55693b7f7bbd2a2f749fdf38e5
+Source path: crates/test/tests/data/
+License:    licenses/delta-io-delta-rs-LICENSE.txt
+
+Vendored directories (tests/fixtures/delta-rs/<name>):
+  table_with_column_mapping   -- real Databricks-written column-mapping (mode=name) table
+  table-with-dv-small          -- real Databricks-written deletion vector table (2 rows deleted)
+
+Refreshing
+----------
+To re-vendor with a newer commit, shallow+blobless clone the source repo, sparse-checkout the
+directories listed above, copy them in, and update the commit SHAs in this file.
