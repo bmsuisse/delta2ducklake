@@ -1,9 +1,5 @@
-import os
-
-import pytest
-
 from delta2ducklake.ducklake.bootstrap import bootstrap_catalog
-from delta2ducklake.ducklake.catalog import PostgresCatalogConfig, SQLiteCatalogConfig
+from delta2ducklake.ducklake.catalog import SQLiteCatalogConfig
 
 
 def test_bootstrap_creates_all_28_tables(tmp_path):
@@ -137,12 +133,8 @@ def test_sqlite_catalog_executemany(tmp_path):
         backend.close()
 
 
-PG_DSN = os.environ.get("DELTA2DUCKLAKE_TEST_PG_DSN")
-
-
-@pytest.mark.skipif(not PG_DSN, reason="set DELTA2DUCKLAKE_TEST_PG_DSN to run Postgres tests")
-def test_postgres_catalog_bootstrap_and_roundtrip(tmp_path):
-    config = PostgresCatalogConfig(PG_DSN)
+def test_postgres_catalog_bootstrap_and_roundtrip(pg_catalog_config, tmp_path):
+    config = pg_catalog_config
     data_path = str(tmp_path / "data") + "/"
     bootstrap_catalog(config, data_path)
 
@@ -151,7 +143,11 @@ def test_postgres_catalog_bootstrap_and_roundtrip(tmp_path):
         tables = {
             r[0]
             for r in backend.fetchall(
-                "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'"
+                # DuckLake's catalog system tables (ducklake_*) live in Postgres's default
+                # "public" schema -- "main" is the separate logical schema DuckLake creates for
+                # *user* tables (bootstrap_catalog's own "main" ducklake_schema row), unrelated to
+                # where the catalog's own bookkeeping tables are stored.
+                "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'"
             )
         }
         assert len(tables) >= 28
