@@ -33,6 +33,15 @@ class StorageBackend(Protocol):
         """Join `table_root` with a Delta-style (percent-encoded, forward-slash) relative path."""
         ...
 
+    def write_bytes(self, path: str, data: bytes) -> None:
+        """Write `data` to `path`, creating any missing parent directories/prefixes.
+
+        The only writer of *new* files in this project (deletion-vector positional-delete
+        Parquet files, written into the DuckLake catalog's own managed `data_path` -- never into
+        the source Delta table's directory, which this project otherwise only ever reads from).
+        """
+        ...
+
 
 class LocalStorageBackend:
     """Reads from the local filesystem. `path` is a plain filesystem path."""
@@ -63,6 +72,11 @@ class LocalStorageBackend:
     def resolve(self, table_root: str, relative_path: str) -> str:
         decoded = unquote(relative_path)
         return str(Path(table_root, *decoded.split("/")))
+
+    def write_bytes(self, path: str, data: bytes) -> None:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(data)
 
 
 class AzureStorageBackend:
@@ -146,6 +160,14 @@ class AzureStorageBackend:
     def resolve(self, table_root: str, relative_path: str) -> str:
         decoded = unquote(relative_path)
         return f"{table_root.rstrip('/')}/{decoded}"
+
+    def write_bytes(self, path: str, data: bytes) -> None:
+        account_url, container, blob_name = self._parse(path)
+        client = self._container_client(account_url, container)
+        try:
+            client.upload_blob(blob_name, data, overwrite=True)
+        except Exception as e:
+            raise StorageError(str(e)) from e
 
 
 def get_storage_backend(table_root: str) -> StorageBackend:

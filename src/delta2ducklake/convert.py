@@ -8,7 +8,9 @@ never silently re-run as a side effect of a copy/sync call.
 from __future__ import annotations
 
 import hashlib
+import uuid
 
+from delta2ducklake.delta.deletion_vector import deleted_row_positions
 from delta2ducklake.delta.schema import parse_schema_string
 from delta2ducklake.delta.state import load_table_state, touched_paths_since
 from delta2ducklake.delta.stats import (
@@ -36,6 +38,42 @@ def _partition_physical_names(schema_tree, partition_columns: list[str]) -> list
     """
     by_name = {f.name: f for f in schema_tree.fields}
     return [(by_name[name].physical_name or name) for name in partition_columns]
+
+
+def _register_deletion_vector(
+    catalog,
+    alloc: IdAllocator,
+    schema_name: str,
+    table_name: str,
+    snapshot_id: int,
+    table_id: int,
+    data_file_id: int,
+    storage,
+    delta_table_root: str,
+    add,
+    ducklake_data_path: str,
+) -> None:
+    """Resolve a Delta deletion vector into row positions, write a DuckLake positional-delete
+    Parquet file for it, and register it against `data_file_id`.
+
+    The delete file is written into the DuckLake catalog's own managed `data_path` -- never into
+    the Delta table's own directory, consistent with this project only ever *reading* from there.
+    """
+    positions = deleted_row_positions(add.deletion_vector, storage, delta_table_root)
+    matched_file_path = storage.resolve(delta_table_root, add.path)
+    parquet_bytes = w.build_positional_delete_parquet(matched_file_path, positions)
+
+    ducklake_storage = get_storage_backend(ducklake_data_path)
+    dest_path = (
+        f"{ducklake_data_path.rstrip('/')}/{schema_name}/{table_name}/{uuid.uuid4()}-delete.parquet"
+    )
+    ducklake_storage.write_bytes(dest_path, parquet_bytes)
+
+    delete_file_id = alloc.alloc_file_id()
+    w.insert_delete_file(
+        catalog, delete_file_id, table_id, snapshot_id, data_file_id, dest_path,
+        len(positions), len(parquet_bytes),
+    )
 
 
 def _write_bookkeeping(
@@ -79,7 +117,8 @@ def copy_table(
     """
     storage = get_storage_backend(delta_table_root)
     state = load_table_state(
-        storage, delta_table_root, end_version=end_version, allow_column_mapping=True
+        storage, delta_table_root, end_version=end_version, allow_column_mapping=True,
+        allow_deletion_vectors=True,
     )
     schema_tree = parse_schema_string(state.metadata.schema_string)
     partition_physical_names = _partition_physical_names(
@@ -124,6 +163,7 @@ def copy_table(
             leaf.path: leaf.delta_type for leaf in iter_leaf_column_stats(schema_tree.fields, None)
         }
         accumulators = w.new_column_accumulators(columns, leaf_types)
+        ducklake_data_path = w.read_data_path(catalog)
 
         total_records = 0
         total_bytes = 0
@@ -150,6 +190,12 @@ def copy_table(
             if partition_id is not None:
                 w.insert_file_partition_values(
                     catalog, data_file_id, table_id, add, partition_physical_names
+                )
+
+            if add.deletion_vector is not None:
+                _register_deletion_vector(
+                    catalog, alloc, schema_name, table_name, new_snapshot_id, table_id,
+                    data_file_id, storage, delta_table_root, add, ducklake_data_path,
                 )
 
             total_records += record_count
@@ -196,7 +242,8 @@ def sync_table(
     """
     storage = get_storage_backend(delta_table_root)
     state = load_table_state(
-        storage, delta_table_root, end_version=end_version, allow_column_mapping=True
+        storage, delta_table_root, end_version=end_version, allow_column_mapping=True,
+        allow_deletion_vectors=True,
     )
     schema_tree = parse_schema_string(state.metadata.schema_string)
     partition_physical_names = _partition_physical_names(
@@ -300,6 +347,7 @@ def sync_table(
         next_row_id = cur_next_row_id
         added_records = 0
         added_bytes = 0
+        ducklake_data_path = w.read_data_path(catalog)
 
         for path in new_paths:
             add = state.active_files[path]
@@ -323,6 +371,12 @@ def sync_table(
             if partition_id is not None:
                 w.insert_file_partition_values(
                     catalog, data_file_id, table_id, add, partition_physical_names
+                )
+
+            if add.deletion_vector is not None:
+                _register_deletion_vector(
+                    catalog, alloc, schema_name, table_name, new_snapshot_id, table_id,
+                    data_file_id, storage, delta_table_root, add, ducklake_data_path,
                 )
 
             added_records += record_count

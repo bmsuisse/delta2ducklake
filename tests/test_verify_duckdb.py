@@ -14,11 +14,12 @@ from delta2ducklake.ducklake.bootstrap import bootstrap_catalog
 from delta2ducklake.ducklake.catalog import SQLiteCatalogConfig
 
 FIXTURES = Path(__file__).parent / "fixtures" / "delta-io"
+DELTA_RS_FIXTURES = Path(__file__).parent / "fixtures" / "delta-rs"
 
 # Fixtures with real backing Parquet files, covering: flat/wide primitives, nested struct/list/map,
 # partitioning, multi-file tables, decimals, all three checkpoint shapes (classic multi-part, V2
-# JSON, V2 Parquet), and both column mapping modes (physical Parquet field names differing from
-# logical column names).
+# JSON, V2 Parquet), both column mapping modes, and deletion vectors (plain, partitioned+
+# checkpointed, combined with column mapping, and assorted log-replay edge cases).
 FIXTURE_NAMES = [
     "parquet-all-types",
     "data-reader-partition-values",
@@ -33,7 +34,14 @@ FIXTURE_NAMES = [
     "data-reader-array-complex-objects",
     "table-with-columnmapping-mode-name",
     "table-with-columnmapping-mode-id",
+    "dv-partitioned-with-checkpoint",
+    "dv-with-columnmapping",
+    "log-replay-dv-key-cases",
 ]
+
+# Real Databricks-written deletion-vector fixture from delta-rs (a different engine than the
+# delta-io fixtures above), lives in a separate vendored directory.
+DELTA_RS_FIXTURE_NAMES = ["table-with-dv-small"]
 
 # data-reader-partition-values has a 12-level nested Hive partition path, one level of which is a
 # timestamp containing a colon (percent-encoded in the path). DuckDB's `delta_scan` extension
@@ -68,9 +76,7 @@ def duckdb_con():
     con.close()
 
 
-@pytest.mark.parametrize("fixture_name", FIXTURE_NAMES)
-def test_copy_table_matches_delta_scan_row_for_row(duckdb_con, tmp_path, fixture_name):
-    table_root = str(FIXTURES / fixture_name)
+def _assert_copy_table_matches_delta_scan(duckdb_con, tmp_path, table_root, fixture_name):
     catalog_path = tmp_path / "catalog.sqlite"
     data_path = str(tmp_path / "data") + "/"
     config = SQLiteCatalogConfig(str(catalog_path))
@@ -99,6 +105,23 @@ def test_copy_table_matches_delta_scan_row_for_row(duckdb_con, tmp_path, fixture
         assert only_in_delta == [], f"{fixture_name}: rows only in delta_scan: {only_in_delta[:3]}"
     finally:
         duckdb_con.sql(f"DETACH {schema_name}")
+
+
+@pytest.mark.parametrize("fixture_name", FIXTURE_NAMES)
+def test_copy_table_matches_delta_scan_row_for_row(duckdb_con, tmp_path, fixture_name):
+    _assert_copy_table_matches_delta_scan(
+        duckdb_con, tmp_path, str(FIXTURES / fixture_name), fixture_name
+    )
+
+
+@pytest.mark.parametrize("fixture_name", DELTA_RS_FIXTURE_NAMES)
+def test_copy_table_matches_delta_scan_row_for_row_delta_rs(duckdb_con, tmp_path, fixture_name):
+    """Same check, against delta-rs's vendored fixtures (a different writer/engine than the
+    delta-io fixtures above) -- currently just the real Databricks-written deletion-vector table.
+    """
+    _assert_copy_table_matches_delta_scan(
+        duckdb_con, tmp_path, str(DELTA_RS_FIXTURES / fixture_name), fixture_name
+    )
 
 
 def test_stats_enable_file_pruning_matching_delta_scan_results(duckdb_con, tmp_path):

@@ -456,3 +456,89 @@ partition value contains a colon): the *same* double-percent-encoding quirk alre
 for `delta_scan` also affects the `ducklake` reader's own Hive-path parsing — confirming it's a
 shared, pre-existing DuckDB-side encoding issue with colon-containing Hive partition values, not
 something introduced by column mapping or specific to one extension.
+
+## Phase 3 — deletion vectors
+
+Delta's deletion vectors mark rows as logically deleted without physically rewriting the Parquet
+file; DuckLake's equivalent is a `ducklake_delete_file` (`format = 'parquet'`, a *positional*
+delete file) registered against a `ducklake_data_file`. Converting one to the other means: decode
+Delta's DV binary format into a set of deleted row positions, then write a new Parquet file in
+DuckLake's own expected shape.
+
+**No RoaringBitmap library dependency.** Delta's deletion vector is a magic number + a portable
+64-bit RoaringBitmap (itself built from 32-bit RoaringBitmaps, one per 32-bit "key" bucket), per
+`PROTOCOL.md` and the RoaringBitmap project's own `RoaringFormatSpec`. Rather than reaching for a
+compiled library (`pyroaring`, wrapping CRoaring) the way the user anticipated might be necessary,
+`delta/deletion_vector.py` hand-decodes both this and the **Z85** (RFC 32) encoding used for
+`pathOrInlineDv` — both are small, fully-specified, stable binary formats (unlike Parquet, which
+absolutely is outsourced to DuckDB), and every byte offset/order was pinned down empirically before
+writing a line of the parser:
+
+- Z85 alphabet and decode logic validated against the RFC's own published test vector
+  (`"HelloWorld"` <-> a specific 8-byte sequence) *and* against real data: decoding the real
+  `table-with-dv-small` fixture's `pathOrInlineDv` reconstructs the UUID `61d16c75-6994-46b7-
+  a15b-8b538852e50e` — which is *exactly* the real `deletion_vector_<uuid>.bin` filename already
+  sitting in that vendored fixture directory.
+- The on-disk DV file wrapper format's byte order (**big-endian** — confirmed by manually walking
+  the real 45-byte `.bin` file: byte 0 is the version, `data[offset:offset+4]` big-endian-decodes
+  to exactly `sizeInBytes=36` from the same commit's JSON) is a different order than the bitmap
+  payload itself (**little-endian**, per `PROTOCOL.md`) — confirmed by checking the bitmap's first
+  4 bytes decode to the documented magic number `1681511377` exactly.
+- The full parse of that same file's bitmap payload (cookie header ->
+  `SERIAL_COOKIE_NO_RUNCONTAINER` -> 1 array container, cardinality 2) walked byte-by-byte by hand
+  and decoded to row positions `{0, 9}` — which independently matches that commit's own
+  `DELETE ... WHERE value IN (0, 9)` operation parameter recorded in the same commit's
+  `commitInfo`. Two unrelated pieces of ground truth (the binary DV and the human-readable delete
+  predicate) agreeing is about as strong a correctness signal as a hand-rolled binary parser can
+  get before shipping it.
+
+**Positional delete file schema, determined empirically (not from any published DuckLake spec
+page).** Had DuckDB's own `ducklake` extension perform a real `DELETE` against a table it manages
+and read the resulting file back: `file_path VARCHAR, pos BIGINT`, where `file_path` holds the
+data file's *absolute*, already-decoded path. (Along the way: DuckLake's own **data inlining**
+feature stores small inserts/deletes directly in the catalog database instead of Parquet files at
+all — the first two probe attempts silently produced *no* delete file on disk because the delete
+was too small to trigger a real file; had to delete >100-ish rows on a large table to see the real
+positional-delete Parquet DuckDB itself writes.)
+
+**Where new delete-file Parquet gets written.** Unlike everything else in this project, this is
+genuinely new derived data with no Delta-side equivalent to reference — it has to be written
+somewhere. Chose the DuckLake catalog's own managed `data_path` (read from `ducklake_metadata`),
+never the Delta table's own directory, consistent with this project only ever *reading* from the
+source table. `storage.py` gained a `write_bytes()` method (Local: `Path.write_bytes`, Azure:
+`ContainerClient.upload_blob`) for this one purpose. `ducklake/writer.py::
+build_positional_delete_parquet()` generates the file via DuckDB itself (writing Parquet, unlike
+everywhere else in this project where DuckDB only ever *reads* one) into a local temp file, whose
+bytes are then handed to `storage.write_bytes()` — one DuckDB API quirk surfaced here: `COPY ...
+TO ?` doesn't bind its destination as a query parameter (parameters silently shifted, converting
+a filename string to `BIGINT[]` and erroring) — fixed by building the relation with bound values
+via `con.sql(..., params=[...])` and calling `.write_parquet()` on it separately, rather than
+parameterizing the `COPY` statement's target path at all.
+
+**Stats/record-count semantics confirmed via the same real-extension probe**: `ducklake_data_file.
+record_count` stays at the *physical* (pre-delete) row count, matching Delta's own protocol
+requirement ("`numRecords` must be present and accurate... equal to the number of records in the
+data file, not the valid records in the logical file" for any file with a DV) -- and, more
+surprisingly, `ducklake_table_stats.record_count` *also* stayed at the physical total after a real
+2000-row delete out of 20000, not the logical (post-delete) count. This matches the spec's explicit
+statement that `DELETE` doesn't require statistics updates at all (bounds only need to stay valid,
+not tight) -- so registering deletion vectors needed no changes to any of the existing record-count/
+stats accumulation logic from phases 1-2, just the new delete-file registration step alongside it.
+
+**Wiring**: `copy_table()`/`sync_table()` now pass `allow_deletion_vectors=True` to
+`load_table_state()`; for any active file whose `add.deletion_vector` is set, `_register_deletion_
+vector()` (shared by both entry points) resolves positions, builds and writes the delete Parquet,
+and registers it. No special-casing needed in `sync_table`'s diffing logic at all: a DV added to an
+existing file is, per Delta's own log semantics, a remove+re-add of that same path -- exactly the
+"changed in place" pattern `touched_paths_since()` (added in phase 1 bug-fixing) already detects
+and handles by retiring the old registration and creating a fresh one, which naturally picks up the
+new deletion vector too. Verified directly: `copy_table()` at `table-with-dv-small`'s v0 (no DV)
+registers zero delete files; `sync_table()` to v1 (DV added) registers exactly one.
+
+**Verification**: all four real DV fixtures — `table-with-dv-small` (delta-rs, the hand-decoded
+ground truth above), `dv-partitioned-with-checkpoint`, `dv-with-columnmapping` (phases 2 and 3
+together), and `log-replay-dv-key-cases` (delta-io) — match `delta_scan` **byte-for-byte** through
+the real DuckDB `ducklake` extension (0 rows differing either direction via `EXCEPT`), added to
+`test_verify_duckdb.py`. This means two entirely independent deletion-vector implementations (DuckDB
+'s own `delta_scan` DV logic, and this project's hand-rolled RoaringBitmap decoder + positional-
+delete-file writer) agree exactly on which rows survive.

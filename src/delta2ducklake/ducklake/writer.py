@@ -8,9 +8,13 @@ register a pre-existing external Parquet file into a DuckLake table without copy
 from __future__ import annotations
 
 import math
+import tempfile
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
+
+import duckdb
 
 from delta2ducklake.delta.actions import AddAction
 from delta2ducklake.delta.schema import (
@@ -619,5 +623,70 @@ def update_table_column_stats(
             max_enc,
             table_id,
             column_id,
+        ),
+    )
+
+
+# --- deletion vectors -> positional delete files -------------------------------------------------
+
+
+def read_data_path(catalog: CatalogBackend) -> str:
+    row = catalog.fetchone("SELECT value FROM ducklake_metadata WHERE key = 'data_path'")
+    if row is None:
+        raise RuntimeError(
+            "ducklake_metadata has no 'data_path' row -- catalog was never bootstrapped"
+        )
+    return row[0]
+
+
+def build_positional_delete_parquet(matched_file_path: str, positions: set[int]) -> bytes:
+    """Build a DuckLake positional-delete Parquet file (columns `file_path VARCHAR`, `pos BIGINT`)
+    for the given deleted row positions, and return its raw bytes.
+
+    Schema and column names confirmed empirically: had DuckDB's own `ducklake` extension perform a
+    real `DELETE` against a table it manages (with data inlining disabled by using a big enough
+    delete that it fell back to a real file), then read the resulting delete file back -- its
+    `file_path` column held the data file's own *absolute*, already-percent-decoded path, which is
+    what `matched_file_path` must be here too.
+    """
+    con = duckdb.connect()
+    tmp = tempfile.NamedTemporaryFile(suffix=".parquet", delete=False)
+    tmp.close()
+    try:
+        # COPY ... TO doesn't bind its destination as a query parameter, so build the relation
+        # with bound values first and write it out separately rather than parameterizing COPY.
+        relation = con.sql(
+            "SELECT ? AS file_path, UNNEST(?::BIGINT[]) AS pos",
+            params=[matched_file_path, sorted(positions)],
+        )
+        relation.write_parquet(tmp.name)
+        return Path(tmp.name).read_bytes()
+    finally:
+        Path(tmp.name).unlink(missing_ok=True)
+
+
+def insert_delete_file(
+    catalog: CatalogBackend,
+    delete_file_id: int,
+    table_id: int,
+    snapshot_id: int,
+    data_file_id: int,
+    path: str,
+    delete_count: int,
+    file_size_bytes: int,
+) -> None:
+    """Register a positional-delete Parquet file. `path` is always absolute (`path_is_relative =
+    False`): delete files are written into the DuckLake catalog's own managed `data_path`, never
+    into the source Delta table's directory (which this project otherwise only ever reads from).
+    """
+    catalog.execute(
+        "INSERT INTO ducklake_delete_file "
+        "(delete_file_id, table_id, begin_snapshot, end_snapshot, data_file_id, path, "
+        "path_is_relative, format, delete_count, file_size_bytes, footer_size, encryption_key, "
+        "partial_max) "
+        "VALUES (?, ?, ?, NULL, ?, ?, ?, 'parquet', ?, ?, NULL, NULL, NULL)",
+        (
+            delete_file_id, table_id, snapshot_id, data_file_id, path, False, delete_count,
+            file_size_bytes,
         ),
     )
