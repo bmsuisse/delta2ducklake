@@ -122,15 +122,35 @@ class PostgresCatalogConfig:
     """Points at a DuckLake catalog stored in Postgres. `dsn` is a libpq keyword=value
     connection string (e.g. ``"host=localhost dbname=mydb user=me password=..."``), accepted
     as-is by both DuckDB's `ducklake:postgres:` attach syntax and `psycopg.connect`.
+
+    Set `entra_user` to authenticate to Azure Database for PostgreSQL with a Entra ID (Azure AD)
+    token instead of a static password, matching the pattern used by `bmsuisse/pgdevkit`: an AAD
+    access token is fetched and used directly as the password. `dsn` should omit `user`/`password`
+    (or they're overridden) in that case. Requires the `delta2ducklake[azure]` extra. Since tokens
+    expire, a fresh one is fetched on every `connect()`/`attach_url()` call rather than once.
     """
 
     dsn: str
+    entra_user: str | None = None
+    managed_identity: bool = False
+
+    def _resolved_dsn(self) -> str:
+        if self.entra_user is None:
+            return self.dsn
+        import psycopg.conninfo
+
+        from delta2ducklake.azure_auth import get_azure_postgres_password
+
+        password = get_azure_postgres_password(managed_identity=self.managed_identity)
+        return psycopg.conninfo.make_conninfo(
+            self.dsn, user=self.entra_user, password=password
+        )
 
     def attach_url(self) -> str:
-        return f"ducklake:postgres:{self.dsn}"
+        return f"ducklake:postgres:{self._resolved_dsn()}"
 
     def connect(self) -> PostgresCatalog:
-        return PostgresCatalog(self.dsn)
+        return PostgresCatalog(self._resolved_dsn())
 
 
 CatalogConfig = SQLiteCatalogConfig | PostgresCatalogConfig

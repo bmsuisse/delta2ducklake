@@ -1,5 +1,5 @@
 from delta2ducklake.ducklake.bootstrap import bootstrap_catalog
-from delta2ducklake.ducklake.catalog import SQLiteCatalogConfig
+from delta2ducklake.ducklake.catalog import PostgresCatalogConfig, SQLiteCatalogConfig
 
 
 def test_bootstrap_creates_all_28_tables(tmp_path):
@@ -131,6 +131,32 @@ def test_sqlite_catalog_executemany(tmp_path):
         assert rows == {"k1": "v1", "k2": "v2"}
     finally:
         backend.close()
+
+
+def test_postgres_catalog_config_entra_user_overrides_credentials(monkeypatch):
+    import psycopg.conninfo
+
+    import delta2ducklake.azure_auth as azure_auth
+
+    monkeypatch.setattr(azure_auth, "get_azure_postgres_password", lambda **kw: "fake-aad-token")
+
+    config = PostgresCatalogConfig(
+        "host=myserver.postgres.database.azure.com dbname=mydb user=old password=old",
+        entra_user="app@mydb",
+    )
+
+    resolved = config.attach_url().removeprefix("ducklake:postgres:")
+    parsed = psycopg.conninfo.conninfo_to_dict(resolved)
+    assert parsed["host"] == "myserver.postgres.database.azure.com"
+    assert parsed["dbname"] == "mydb"
+    assert parsed["user"] == "app@mydb"
+    assert parsed["password"] == "fake-aad-token"
+
+
+def test_postgres_catalog_config_without_entra_user_is_unchanged():
+    dsn = "host=localhost dbname=mydb user=me password=secret"
+    config = PostgresCatalogConfig(dsn)
+    assert config.attach_url() == f"ducklake:postgres:{dsn}"
 
 
 def test_postgres_catalog_bootstrap_and_roundtrip(pg_catalog_config, tmp_path):

@@ -35,6 +35,30 @@ def _add_catalog_arg(parser: argparse.ArgumentParser) -> None:
         help="DuckLake catalog location, e.g. 'sqlite:./catalog.db' or "
         "'postgres:host=localhost dbname=mydb user=me password=...'",
     )
+    parser.add_argument(
+        "--entra-user",
+        default=None,
+        metavar="USER",
+        help="Postgres catalog only: authenticate to Azure Database for PostgreSQL as this user "
+        "with an Entra ID token instead of a static password (requires delta2ducklake[azure])",
+    )
+    parser.add_argument(
+        "--managed-identity",
+        action="store_true",
+        help="With --entra-user, fetch the Entra ID token via ManagedIdentityCredential instead "
+        "of DefaultAzureCredential",
+    )
+
+
+def _resolve_catalog(args: argparse.Namespace) -> CatalogConfig:
+    catalog = args.catalog
+    if args.entra_user is None:
+        return catalog
+    if not isinstance(catalog, PostgresCatalogConfig):
+        raise argparse.ArgumentTypeError("--entra-user only applies to a 'postgres:' --catalog")
+    return PostgresCatalogConfig(
+        dsn=catalog.dsn, entra_user=args.entra_user, managed_identity=args.managed_identity
+    )
 
 
 def _add_table_args(parser: argparse.ArgumentParser) -> None:
@@ -100,26 +124,27 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        catalog = _resolve_catalog(args)
         if args.command == "bootstrap":
-            bootstrap_catalog(args.catalog, args.data_path)
+            bootstrap_catalog(catalog, args.data_path)
             print(f"Bootstrapped DuckLake catalog (data_path={args.data_path!r})")
         elif args.command == "copy":
             table_id = copy_table(
-                args.delta_table_root, args.catalog, args.table,
+                args.delta_table_root, catalog, args.table,
                 schema_name=args.schema, end_version=args.version,
             )
             print(f"Registered {args.schema}.{args.table} (table_id={table_id})")
         elif args.command == "sync":
             table_id = sync_table(
-                args.delta_table_root, args.catalog, args.table,
+                args.delta_table_root, catalog, args.table,
                 schema_name=args.schema, end_version=args.version,
             )
             print(f"Synced {args.schema}.{args.table} (table_id={table_id})")
         elif args.command == "refresh-stats":
             columns = args.columns.split(",") if args.columns else None
-            refresh_stats(args.catalog, args.table, schema_name=args.schema, columns=columns)
+            refresh_stats(catalog, args.table, schema_name=args.schema, columns=columns)
             print(f"Refreshed stats for {args.schema}.{args.table}")
-    except (ValueError, NotImplementedError, RuntimeError) as e:
+    except (ValueError, NotImplementedError, RuntimeError, argparse.ArgumentTypeError) as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
     return 0

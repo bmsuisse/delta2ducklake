@@ -66,6 +66,19 @@ catalog = PostgresCatalogConfig("host=localhost dbname=mydb user=me password=...
 bootstrap_catalog(catalog, data_path="/abs/path/to/ducklake_data/")  # or an Azure URL, see below
 ```
 
+For Azure Database for PostgreSQL, authenticate with an Entra ID (Azure AD) token instead of a
+static password by setting `entra_user` (needs `delta2ducklake[azure]`; mirrors the pattern used by
+[`bmsuisse/pgdevkit`](https://github.com/bmsuisse/pgdevkit)). A fresh token is fetched on every
+`connect()`/bootstrap, since Entra tokens expire:
+
+```python
+catalog = PostgresCatalogConfig(
+    "host=myserver.postgres.database.azure.com dbname=mydb",
+    entra_user="app@mydb",       # omit user/password from the DSN — these are supplied for you
+    managed_identity=False,      # True to use ManagedIdentityCredential instead of DefaultAzureCredential
+)
+```
+
 Then query the result with DuckDB directly:
 
 ```sql
@@ -94,6 +107,11 @@ delta2ducklake sync   /path/to/my_delta_table --catalog sqlite:catalog.sqlite --
 delta2ducklake refresh-stats --catalog sqlite:catalog.sqlite --table my_table --columns a,b
 
 # Postgres: --catalog "postgres:host=localhost dbname=mydb user=me password=..."
+
+# Azure Postgres with an Entra ID token instead of a static password:
+delta2ducklake copy /path/to/my_delta_table \
+  --catalog "postgres:host=myserver.postgres.database.azure.com dbname=mydb" \
+  --entra-user app@mydb --table my_table
 ```
 
 Run `delta2ducklake <command> --help` for the full option list (e.g. `--schema`, `--version` for
