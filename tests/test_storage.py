@@ -5,6 +5,7 @@ from delta2ducklake.storage import (
     LocalStorageBackend,
     StorageError,
     get_storage_backend,
+    to_duckdb_uri,
 )
 
 
@@ -70,3 +71,36 @@ def test_azure_backend_parse_https_and_abfss_agree():
         "mycontainer",
         "some/blob.parquet",
     )
+
+
+def test_to_duckdb_uri_rewrites_databricks_style_abfss():
+    assert (
+        to_duckdb_uri("abfss://mycontainer@myaccount.dfs.core.windows.net/some/path")
+        == "abfss://myaccount.dfs.core.windows.net/mycontainer/some/path"
+    )
+
+
+def test_to_duckdb_uri_rewrites_bare_container_root():
+    assert (
+        to_duckdb_uri("abfss://mycontainer@myaccount.dfs.core.windows.net/")
+        == "abfss://myaccount.dfs.core.windows.net/mycontainer/"
+    )
+
+
+def test_to_duckdb_uri_handles_abfs_scheme_too():
+    assert (
+        to_duckdb_uri("abfs://mycontainer@myaccount.dfs.core.windows.net/some/path")
+        == "abfs://myaccount.dfs.core.windows.net/mycontainer/some/path"
+    )
+
+
+def test_to_duckdb_uri_leaves_already_duckdb_style_abfss_unchanged():
+    already_ok = "abfss://myaccount.dfs.core.windows.net/mycontainer/some/path"
+    assert to_duckdb_uri(already_ok) == already_ok
+
+
+def test_to_duckdb_uri_leaves_other_schemes_unchanged():
+    https_path = "https://myaccount.blob.core.windows.net/mycontainer/some/path"
+    local_path = "/some/local/path"
+    assert to_duckdb_uri(https_path) == https_path
+    assert to_duckdb_uri(local_path) == local_path

@@ -21,7 +21,7 @@ from delta2ducklake.delta.stats import (
 from delta2ducklake.ducklake import writer as w
 from delta2ducklake.ducklake.catalog import CatalogConfig
 from delta2ducklake.ducklake.model import IdAllocator
-from delta2ducklake.storage import get_storage_backend
+from delta2ducklake.storage import get_storage_backend, to_duckdb_uri
 
 SOURCE_PATH_KEY = "delta2ducklake.source_path"
 SOURCE_VERSION_KEY = "delta2ducklake.source_version"
@@ -148,7 +148,7 @@ def copy_table(
 
         table_id, columns = w.create_table(
             catalog, alloc, new_snapshot_id, schema_id, table_name, schema_tree.fields,
-            delta_table_root,
+            to_duckdb_uri(delta_table_root),
         )
         path_to_id = w.path_to_column_id(columns)
 
