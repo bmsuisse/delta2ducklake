@@ -93,3 +93,35 @@ def load_table_state(
     return DeltaTableState(
         version=last_version, metadata=metadata, protocol=protocol, active_files=active_files
     )
+
+
+def touched_paths_since(
+    storage: StorageBackend,
+    table_root: str,
+    since_version_exclusive: int,
+    end_version: int | None = None,
+) -> set[str]:
+    """Paths with at least one add or remove action strictly after `since_version_exclusive`, up
+    to `end_version`.
+
+    Used by `sync_table` for something a pure before/after active-file-set diff can't tell it:
+    whether a path that's active *both* before and after the sync window was actually removed and
+    re-added in between (e.g. a deletion-vector update, or -- as exercised by the vendored
+    `delete-re-add-same-file-different-transactions` fixture -- a path reused across two separate
+    transactions). Such a path needs its DuckLake registration refreshed even though it never left
+    the active set, since the underlying `AddAction` (stats, size, ...) may differ.
+
+    Conservative by construction if a checkpoint spanning past `since_version_exclusive` is used
+    for replay (its actions are tagged with the checkpoint's own version, which is `>
+    since_version_exclusive`): every file in that squashed batch counts as "touched," which is
+    always safe (just means `sync_table` refreshes more than the strict minimum in that case)
+    rather than silently missing a change.
+    """
+    touched: set[str] = set()
+    for version, actions in iter_versions(storage, table_root, end_version=end_version):
+        if version <= since_version_exclusive:
+            continue
+        for a in actions:
+            if isinstance(a, (AddAction, RemoveAction)):
+                touched.add(a.path)
+    return touched

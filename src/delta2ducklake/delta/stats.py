@@ -139,6 +139,25 @@ def encode_ducklake_stat(value: object, delta_type: str) -> tuple[str | None, bo
     raise ValueError(f"Don't know how to encode a stats value for Delta type {delta_type!r}")
 
 
+def decode_ducklake_stat(value: str | None, delta_type: str) -> object:
+    """Inverse of `encode_ducklake_stat`, for merging a newly-computed bound with a bound already
+    stored in `ducklake_table_column_stats` (needed when `sync_table` adds files to an existing
+    table). Only meaningful for values produced by `encode_ducklake_stat` itself -- numeric types
+    are parsed back to `int`/`float` since comparing their encoded strings directly is wrong
+    (`"10" < "9"`); date/timestamp/string values are left as-is and compared as strings, which is
+    safe *only* because `encode_ducklake_stat` always normalizes them to one consistent format.
+    """
+    if value is None:
+        return None
+    if delta_type == "boolean":
+        return value == "1"
+    if delta_type in ("byte", "short", "integer", "long"):
+        return int(value)
+    if delta_type in ("float", "double") or delta_type.startswith("decimal"):
+        return float(value)
+    return value
+
+
 def read_parquet_record_count(storage: StorageBackend, path: str) -> int:
     """Fallback row count for a data file whose `add` action carries no `stats` at all.
 

@@ -120,3 +120,19 @@ def ducklake_primitive_type(delta_type_name: str) -> str:
         precision, scale = m.groups()
         return f"decimal({precision},{scale})"
     raise ValueError(f"Unsupported/unmapped Delta primitive type: {delta_type_name!r}")
+
+
+def ducklake_column_type(delta_type: DeltaType) -> str:
+    """Map any `DeltaType` node (primitive or nested) to the string DuckLake's `ducklake_column.
+    column_type` expects. Nested types are represented as bare "list"/"struct"/"map" -- their
+    element/field types get their own child `ducklake_column` rows instead (via `parent_column`).
+    """
+    if isinstance(delta_type, PrimitiveType):
+        return ducklake_primitive_type(delta_type.name)
+    if isinstance(delta_type, ArrayType):
+        return "list"
+    if isinstance(delta_type, MapType):
+        return "map"
+    if isinstance(delta_type, StructType):
+        return "struct"
+    raise TypeError(f"Unknown DeltaType node: {delta_type!r}")
