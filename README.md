@@ -115,3 +115,8 @@ test provisions and tears down its own isolated database):
 export DELTA2DUCKLAKE_TEST_PG_DSN="host=localhost port=5432 user=postgres password=..."
 uv run pytest
 ```
+
+CI (`.github/workflows/ci.yml`) runs lint + the full test suite, including Postgres, against a
+`postgres:` service container on every push/PR. Publishing (`.github/workflows/publish.yml`) runs
+on GitHub Release and pushes to PyPI via [Trusted Publishing](https://docs.pypi.org/trusted-publishers/)
+(OIDC, no stored token) — set that up once in the PyPI project's settings before cutting a release.
