@@ -286,3 +286,36 @@ files/20 rows, `sync_table` to v2 → 2 files/10 rows with the other 4 correctly
 `end_snapshot` rather than deleted outright, `sync_table` to v3 → 4 files/30 rows) and the
 synthetic changed-in-place case above (old `data_file_id` retired, new one allocated, record count
 not double-counted).
+
+## ducklake/stats_refresh.py
+
+The standalone "extend/recompute stats for given columns" utility, requested explicitly rather than
+inferred: `refresh_stats(catalog_config, table_name, columns=None)` scans a table's already-
+registered Parquet files directly via DuckDB and (re)writes `ducklake_file_column_stats`/
+`ducklake_table_column_stats` — independent of Delta entirely, so it works on any DuckLake table,
+not just ones `copy_table()` produced. Its main real-world use: Delta's own
+`dataSkippingNumIndexedCols` setting caps how many columns get per-file stats at write time, so
+trailing columns in a wide table are frequently missing stats altogether even in a
+perfectly-normal, unmodified Delta table — this fills them in from the actual data.
+
+Encoding here needed its own small sibling to `delta/stats.py`'s `encode_ducklake_stat`:
+`_encode_value()` operates on values DuckDB itself returns from `read_parquet()` (real
+`datetime.date`/`datetime.datetime`/`decimal.Decimal`/`bytes`/`uuid.UUID` objects), not Delta's
+JSON-decoded stats values — different input domain, identical output format, so keeping them as two
+small functions was clearer than forcing one function to handle both. One column-count aggregate
+query per data file computes `count(*)`, `count(col)`, `min(col)`, `max(col)`, and (float columns
+only — `isnan()` errors on non-float types in DuckDB) a NaN check for every requested column at
+once, rather than one round trip per column.
+
+Verified two ways against `parquet-all-types` (already `copy_table()`-registered): (1) re-running
+`refresh_stats()` over columns Delta *did* already collect stats for (`ByteType`, `IntegerType`,
+`StringType`, `DateType`) reproduces byte-identical `contains_null`/`min_value`/`max_value` to what
+`copy_table()` got straight from Delta's own `add.stats` — a good independent cross-check that both
+paths agree on the same ground truth. (`TimestampType` was deliberately excluded from this
+particular check: DuckDB normalizes `TIMESTAMPTZ` values it reads back to a canonical offset, which
+can legitimately differ in *string form* from whatever offset Delta's writer originally recorded for
+the same instant — both representations are valid, they just don't compare equal as strings, so
+that's not a fair byte-for-byte check.) (2) `refresh_stats(columns=["BooleanType"])` correctly
+backfills real bounds (`"0"`/`"1"`) for the one column this fixture's writer collected *no* stats
+for at all, without touching any other column's existing stats — the actual "Delta never collected
+this" scenario the utility exists for.
