@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from datetime import date, datetime
 
 import duckdb
 
@@ -37,8 +38,10 @@ def _encode_value(value: object, ducklake_type: str) -> tuple[str | None, bool]:
     if ducklake_type == "boolean":
         return ("1" if value else "0"), False
     if ducklake_type in ("int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64"):
+        assert isinstance(value, (int, float, str))
         return str(int(value)), False
     if ducklake_type in _FLOAT_TYPES:
+        assert isinstance(value, (int, float, str))
         f = float(value)
         if math.isnan(f):
             return None, True
@@ -48,12 +51,15 @@ def _encode_value(value: object, ducklake_type: str) -> tuple[str | None, bool]:
     if ducklake_type.startswith("decimal"):
         return str(value), False
     if ducklake_type == "date":
+        assert isinstance(value, date)
         return value.isoformat(), False
     if ducklake_type in ("timestamp", "timestamptz"):
+        assert isinstance(value, datetime)
         return value.isoformat(sep=" "), False
     if ducklake_type in ("varchar", "json"):
         return str(value), False
     if ducklake_type == "blob":
+        assert isinstance(value, bytes)
         return value.hex(), False
     if ducklake_type == "uuid":
         return str(value), False
@@ -93,9 +99,11 @@ def refresh_stats(
         if table_id is None:
             raise ValueError(f"Table {schema_name}.{table_name} does not exist")
 
-        table_path, table_path_is_relative = catalog.fetchone(
+        table_row = catalog.fetchone(
             "SELECT path, path_is_relative FROM ducklake_table WHERE table_id = ?", (table_id,)
         )
+        assert table_row is not None
+        table_path, table_path_is_relative = table_row
         if table_path_is_relative:
             raise NotImplementedError(
                 "refresh_stats() only supports tables with an absolute path today "
@@ -145,7 +153,9 @@ def refresh_stats(
                     select_parts.append(f'false AS "{c.column_id}__nan"')
             quoted_path = full_path.replace("'", "''")
             rel = con.sql(f"SELECT {', '.join(select_parts)} FROM read_parquet('{quoted_path}')")
-            values = dict(zip(rel.columns, rel.fetchone(), strict=True))
+            row = rel.fetchone()
+            assert row is not None
+            values = dict(zip(rel.columns, row, strict=True))
             n = values["__n"]
 
             for c in leaf_columns:

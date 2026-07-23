@@ -12,7 +12,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import LiteralString, Protocol, cast, runtime_checkable
 
 
 @runtime_checkable
@@ -70,8 +70,11 @@ class PostgresCatalog:
         self._conn = psycopg.connect(dsn)
 
     @staticmethod
-    def _translate(sql: str) -> str:
-        return sql.replace("?", "%s")
+    def _translate(sql: str) -> LiteralString:
+        # psycopg's stubs require LiteralString for a raw query string (its way of flagging
+        # "not attacker-controlled"); safe here since delta2ducklake only ever translates its own
+        # static SQL templates, never a string built from external input.
+        return cast(LiteralString, sql.replace("?", "%s"))
 
     def execute(self, sql: str, params: Sequence = ()) -> None:
         with self._conn.cursor() as cur:

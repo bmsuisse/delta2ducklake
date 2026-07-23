@@ -102,9 +102,10 @@ time travel).
 ## Development
 
 ```bash
-uv sync --all-extras
+uv sync --all-extras --all-groups
 uv run pytest
 uv run ruff check src tests
+uv run ty check src/delta2ducklake
 ```
 
 Postgres-backed tests are skipped unless `DELTA2DUCKLAKE_TEST_PG_DSN` is set to a libpq
@@ -116,7 +117,8 @@ export DELTA2DUCKLAKE_TEST_PG_DSN="host=localhost port=5432 user=postgres passwo
 uv run pytest
 ```
 
-CI (`.github/workflows/ci.yml`) runs lint + the full test suite, including Postgres, against a
-`postgres:` service container on every push/PR. Publishing (`.github/workflows/publish.yml`) runs
-on GitHub Release and pushes to PyPI via [Trusted Publishing](https://docs.pypi.org/trusted-publishers/)
-(OIDC, no stored token) — set that up once in the PyPI project's settings before cutting a release.
+CI (`.github/workflows/python-test.yml`) runs lint, `ty check`, and the full test suite (including
+Postgres, against a `postgres:` service container) on every push/PR. Publishing
+(`.github/workflows/python-publish.yml`) runs on GitHub Release (or manual dispatch) and pushes to
+PyPI via [Trusted Publishing](https://docs.pypi.org/trusted-publishers/) (OIDC, no stored token) —
+set that up once in the PyPI project's settings before cutting a release.

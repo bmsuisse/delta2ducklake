@@ -25,7 +25,12 @@ from delta2ducklake.delta.schema import (
     StructType,
     ducklake_column_type,
 )
-from delta2ducklake.delta.stats import LeafColumnStats, decode_ducklake_stat, encode_ducklake_stat
+from delta2ducklake.delta.stats import (
+    LeafColumnStats,
+    StatValue,
+    decode_ducklake_stat,
+    encode_ducklake_stat,
+)
 from delta2ducklake.ducklake.catalog import CatalogBackend
 from delta2ducklake.ducklake.model import FlattenedColumn, IdAllocator, Snapshot
 
@@ -417,8 +422,8 @@ class ColumnStatsAccumulator:
     delta_type: str
     contains_null: bool = False
     contains_nan: bool = False
-    min_value: object = None
-    max_value: object = None
+    min_value: StatValue | None = None
+    max_value: StatValue | None = None
     min_set: bool = False
     max_set: bool = False
     unknown_null_count: bool = False
@@ -432,6 +437,16 @@ def new_column_accumulators(
         for c in columns
         if c.path in leaf_types
     }
+
+
+def _lt(a: StatValue, b: StatValue) -> bool:
+    """Safe only because every value folded into one column's accumulator shares the same
+    underlying type by construction (Delta/DuckLake stats are homogeneously typed per column)."""
+    return a < b  # ty: ignore[unsupported-operator]
+
+
+def _gt(a: StatValue, b: StatValue) -> bool:
+    return a > b  # ty: ignore[unsupported-operator]
 
 
 def fold_leaf_into_accumulator(
@@ -451,11 +466,11 @@ def fold_leaf_into_accumulator(
             agg.contains_nan = True
             continue
         if is_min:
-            if not agg.min_set or value < agg.min_value:
+            if agg.min_value is None or _lt(value, agg.min_value):
                 agg.min_value = value
                 agg.min_set = True
         else:
-            if not agg.max_set or value > agg.max_value:
+            if agg.max_value is None or _gt(value, agg.max_value):
                 agg.max_value = value
                 agg.max_set = True
 

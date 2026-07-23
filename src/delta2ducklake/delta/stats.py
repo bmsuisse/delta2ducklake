@@ -17,6 +17,9 @@ import duckdb
 from delta2ducklake.delta.schema import PrimitiveType, StructField, StructType
 from delta2ducklake.storage import LocalStorageBackend, StorageBackend
 
+# The universe of JSON-native scalar values Delta's minValues/maxValues/nullCount ever hold.
+StatValue = int | float | str | bool
+
 
 @dataclass(frozen=True)
 class ParsedStats:
@@ -43,8 +46,8 @@ def parse_add_stats(stats_json: str | None) -> ParsedStats | None:
 class LeafColumnStats:
     path: tuple[str, ...]  # dotted path from the table root, e.g. ("a", "ac", "aca")
     delta_type: str  # Delta primitive type name, e.g. "long", "decimal(10,2)"
-    min_value: object
-    max_value: object
+    min_value: StatValue | None
+    max_value: StatValue | None
     null_count: int | None
 
 
@@ -96,7 +99,7 @@ def _reformat_timestamp(value: str, *, with_offset: bool) -> str:
     return dt.replace(tzinfo=None).isoformat(sep=" ", timespec="microseconds")
 
 
-def encode_ducklake_stat(value: object, delta_type: str) -> tuple[str | None, bool]:
+def encode_ducklake_stat(value: StatValue | None, delta_type: str) -> tuple[str | None, bool]:
     """Encode a raw JSON-decoded Delta stats value into DuckLake's string encoding for `delta_type`.
 
     Returns `(encoded_value, is_nan)`. `is_nan` is only ever `True` for float columns whose stats
@@ -111,9 +114,11 @@ def encode_ducklake_stat(value: object, delta_type: str) -> tuple[str | None, bo
         return ("1" if value else "0"), False
 
     if delta_type in ("byte", "short", "integer", "long"):
+        assert isinstance(value, (int, float, str))
         return str(int(value)), False
 
     if delta_type in ("float", "double"):
+        assert isinstance(value, (int, float, str))
         f = float(value)
         if math.isnan(f):
             return None, True
@@ -147,7 +152,7 @@ def encode_ducklake_stat(value: object, delta_type: str) -> tuple[str | None, bo
     raise ValueError(f"Don't know how to encode a stats value for Delta type {delta_type!r}")
 
 
-def decode_ducklake_stat(value: str | None, delta_type: str) -> object:
+def decode_ducklake_stat(value: str | None, delta_type: str) -> StatValue | None:
     """Inverse of `encode_ducklake_stat`, for merging a newly-computed bound with a bound already
     stored in `ducklake_table_column_stats` (needed when `sync_table` adds files to an existing
     table). Only meaningful for values produced by `encode_ducklake_stat` itself -- numeric types
@@ -183,9 +188,9 @@ def read_parquet_record_count(storage: StorageBackend, path: str) -> int:
         real_path = tmp.name
     try:
         quoted = real_path.replace("'", "''")
-        (count,) = con.sql(
-            f"SELECT sum(num_rows) FROM parquet_file_metadata('{quoted}')"
-        ).fetchone()
+        row = con.sql(f"SELECT sum(num_rows) FROM parquet_file_metadata('{quoted}')").fetchone()
+        assert row is not None
+        (count,) = row
         return int(count)
     finally:
         if tmp is not None:

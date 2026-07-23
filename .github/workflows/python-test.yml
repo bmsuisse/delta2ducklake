@@ -1,0 +1,50 @@
+name: Python Test
+
+on:
+  push:
+    branches: ["main"]
+    paths-ignore: ["README.md", "docs", ".github"]
+  pull_request:
+    branches: ["main"]
+    paths-ignore: ["README.md", "docs", ".github"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11"]
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: "recursive"
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install uv
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+      - name: Install project dependencies
+        run: uv sync --all-extras --all-groups
+      - name: Lint
+        run: uv run ruff check src tests
+      - name: ty check
+        run: uv run ty check src/delta2ducklake
+      - name: Test with pytest
+        env:
+          DELTA2DUCKLAKE_TEST_PG_DSN: host=localhost port=5432 user=postgres password=postgres
+        run: uv run -m pytest --capture=tee-sys --maxfail=3 tests
