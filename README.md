@@ -10,7 +10,12 @@ Status: beta. Published on [PyPI](https://pypi.org/project/delta2ducklake/).
 
 - Full (`copy_table`) and incremental (`sync_table`) conversion, including table/file statistics
   and Hive-style partitioning
-- Delta column mapping (`columnMapping.mode = name` / `id`)
+- Delta column mapping (`columnMapping.mode = name` / `id`) -- including tables where enabling it
+  also replaced Hive-style partition directories with opaque names (common on Databricks/Unity
+  Catalog): pass `materialize_partitions="auto"` (or a directory) to `copy_table`/`sync_table` to
+  work around DuckDB's own `ducklake` reader requiring a real `column=value` layout to reconstruct
+  partition values -- see `docs/IMPLEMENTATION.md` for why, and what it costs (extra storage, one
+  real copy of the affected Parquet files)
 - Deletion vectors, converted to DuckLake positional delete files
 - A standalone `refresh_stats()` utility to (re)compute stats for any DuckLake table's columns
   (useful since Delta's `dataSkippingNumIndexedCols` often leaves trailing columns with none)
@@ -19,8 +24,7 @@ Status: beta. Published on [PyPI](https://pypi.org/project/delta2ducklake/).
 - Storage backends: local filesystem, Azure Blob/ADLS Gen2 (`delta2ducklake[azure]`)
 
 See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) for design notes, protocol details pinned
-down against real fixtures, and known limitations (e.g. DuckDB's own `ducklake` reader can't
-materialize partition column values for tables whose physical layout isn't Hive-style).
+down against real fixtures, and known limitations.
 
 Ships an [Agent Skill](https://code.claude.com/docs/en/skills) at
 `delta2ducklake/skills/delta2ducklake/SKILL.md` (included in the installed package) so AI coding

@@ -13,6 +13,8 @@ from delta2ducklake.convert import copy_table
 from delta2ducklake.ducklake.bootstrap import bootstrap_catalog
 from delta2ducklake.ducklake.catalog import SQLiteCatalogConfig
 
+MATERIALIZE_FIXTURE = "table_with_column_mapping"
+
 FIXTURES = Path(__file__).parent / "fixtures" / "delta-io"
 DELTA_RS_FIXTURES = Path(__file__).parent / "fixtures" / "delta-rs"
 
@@ -122,6 +124,37 @@ def test_copy_table_matches_delta_scan_row_for_row_delta_rs(duckdb_con, tmp_path
     _assert_copy_table_matches_delta_scan(
         duckdb_con, tmp_path, str(DELTA_RS_FIXTURES / fixture_name), fixture_name
     )
+
+
+def test_materialize_partitions_readable_through_real_ducklake_extension(duckdb_con, tmp_path):
+    """The one case `_assert_copy_table_matches_delta_scan`'s FIXTURE_NAMES/DELTA_RS_FIXTURE_NAMES
+    loop can't cover directly: `table_with_column_mapping`'s own directory layout ("8v"/"BH",
+    opaque -- no `column=value` at all) makes DuckDB's real `ducklake` reader fail outright without
+    materialize_partitions (see docs/IMPLEMENTATION.md). With it, the materialized copies live
+    under a genuine Hive path this project builds itself (delta.partition_layout.encode_hive_value)
+    -- this is the empirical proof that DuckDB's own Hive-partition decoder actually accepts that
+    encoding and reconstructs the right values, not just that delta2ducklake's own catalog rows
+    look correct (already unit-tested in test_column_mapping.py).
+    """
+    table_root = str(DELTA_RS_FIXTURES / MATERIALIZE_FIXTURE)
+    catalog_path = tmp_path / "catalog.sqlite"
+    data_path = str(tmp_path / "data") + "/"
+    config = SQLiteCatalogConfig(str(catalog_path))
+    bootstrap_catalog(config, data_path)
+    copy_table(table_root, config, "t", materialize_partitions="auto")
+
+    duckdb_con.sql(
+        f"ATTACH '{config.attach_url()}' AS dl_materialize (DATA_PATH '{data_path}', READ_ONLY)"
+    )
+    try:
+        q_dl = "SELECT * FROM dl_materialize.t"
+        q_delta = f"SELECT * FROM delta_scan('{table_root}')"
+        only_in_dl = duckdb_con.sql(f"({q_dl}) EXCEPT ({q_delta})").fetchall()
+        only_in_delta = duckdb_con.sql(f"({q_delta}) EXCEPT ({q_dl})").fetchall()
+        assert only_in_dl == [], f"rows only in materialized ducklake catalog: {only_in_dl[:3]}"
+        assert only_in_delta == [], f"rows only in delta_scan: {only_in_delta[:3]}"
+    finally:
+        duckdb_con.sql("DETACH dl_materialize")
 
 
 def test_stats_enable_file_pruning_matching_delta_scan_results(duckdb_con, tmp_path):
