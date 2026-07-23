@@ -13,7 +13,14 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from delta2ducklake.delta.actions import AddAction
-from delta2ducklake.delta.schema import StructField, StructType, ducklake_column_type
+from delta2ducklake.delta.schema import (
+    ArrayType,
+    DeltaType,
+    MapType,
+    StructField,
+    StructType,
+    ducklake_column_type,
+)
 from delta2ducklake.delta.stats import LeafColumnStats, decode_ducklake_stat, encode_ducklake_stat
 from delta2ducklake.ducklake.catalog import CatalogBackend
 from delta2ducklake.ducklake.model import FlattenedColumn, IdAllocator, Snapshot
@@ -98,39 +105,56 @@ def flatten_schema(
     `column_id` (from the catalog-id counter) to every node -- including `struct`/`list`/`map`
     container columns themselves, which get their own row with no stats, per DuckLake's nested
     type model (`parent_column` links a child to its container).
+
+    `list`/`map` children are synthesized as `"element"` / `"key"`+`"value"` (DuckDB's own naming
+    for these, confirmed against DuckLake's `data_types.md` nested-type example) since Delta's
+    schema JSON doesn't name them at all. This isn't optional: DuckDB's real `ducklake` extension
+    crashes trying to read a `list`/`map` column that has no matching child row (confirmed by
+    attaching a real catalog missing them and observing an internal DuckDB assertion failure).
     """
     result: list[FlattenedColumn] = []
-    _flatten_fields(fields, alloc, parent_column_id=None, path=(), out=result)
+    for order, f in enumerate(fields):
+        _flatten_node(f.name, f.type, f.nullable, order, alloc, None, (), result)
     return result
 
 
-def _flatten_fields(
-    fields: tuple[StructField, ...],
+def _flatten_node(
+    name: str,
+    delta_type: DeltaType,
+    nullable: bool,
+    column_order: int,
     alloc: IdAllocator,
     parent_column_id: int | None,
     path: tuple[str, ...],
     out: list[FlattenedColumn],
 ) -> None:
-    for order, f in enumerate(fields):
-        column_id = alloc.alloc_catalog_id()
-        child_path = (*path, f.name)
-        out.append(
-            FlattenedColumn(
-                column_id=column_id,
-                path=child_path,
-                name=f.name,
-                column_order=order,
-                ducklake_type=ducklake_column_type(f.type),
-                nulls_allowed=f.nullable,
-                parent_column_id=parent_column_id,
-            )
+    column_id = alloc.alloc_catalog_id()
+    child_path = (*path, name)
+    out.append(
+        FlattenedColumn(
+            column_id=column_id,
+            path=child_path,
+            name=name,
+            column_order=column_order,
+            ducklake_type=ducklake_column_type(delta_type),
+            nulls_allowed=nullable,
+            parent_column_id=parent_column_id,
         )
-        if isinstance(f.type, StructType):
-            _flatten_fields(f.type.fields, alloc, column_id, child_path, out)
-        # ArrayType/MapType: DuckLake models element/key/value as child columns too, but Delta's
-        # schema JSON doesn't name them and phase 1 doesn't need per-element stats or pruning, so
-        # they're represented as a single leaf-like container column for now (record_count/schema
-        # correctness is unaffected; only column-level stats on array elements would be missing).
+    )
+    if isinstance(delta_type, StructType):
+        for order, f in enumerate(delta_type.fields):
+            _flatten_node(f.name, f.type, f.nullable, order, alloc, column_id, child_path, out)
+    elif isinstance(delta_type, ArrayType):
+        _flatten_node(
+            "element", delta_type.element_type, delta_type.contains_null, 0, alloc, column_id,
+            child_path, out,
+        )
+    elif isinstance(delta_type, MapType):
+        _flatten_node("key", delta_type.key_type, False, 0, alloc, column_id, child_path, out)
+        _flatten_node(
+            "value", delta_type.value_type, delta_type.value_contains_null, 1, alloc, column_id,
+            child_path, out,
+        )
 
 
 def insert_columns(
@@ -178,17 +202,75 @@ def create_table(
     absolute path (`path_is_relative = False`) pointing at the Delta table's own root directory --
     every data file's path is then just Delta's own relative `add.path` underneath it, so the
     physical file location never changes.
+
+    DuckLake joins `table.path` and a relative file path by plain string concatenation (confirmed
+    against a real catalog: bootstrap's own "main" schema is stored as `"main/"`, trailing slash
+    included) rather than inserting a separator -- so the trailing slash is mandatory, not cosmetic.
     """
     table_id = alloc.alloc_catalog_id()
+    normalized_path = table_path.rstrip("/") + "/"
     catalog.execute(
         "INSERT INTO ducklake_table "
         "(table_id, table_uuid, begin_snapshot, end_snapshot, schema_id, table_name, path, "
         "path_is_relative) VALUES (?, ?, ?, NULL, ?, ?, ?, ?)",
-        (table_id, str(uuid.uuid4()), snapshot_id, schema_id, table_name, table_path, False),
+        (table_id, str(uuid.uuid4()), snapshot_id, schema_id, table_name, normalized_path, False),
     )
     columns = flatten_schema(fields, alloc)
     insert_columns(catalog, snapshot_id, table_id, columns)
     return table_id, columns
+
+
+# --- name mapping (map_by_name) ------------------------------------------------------------------
+
+
+def create_name_mapping(
+    catalog: CatalogBackend,
+    alloc: IdAllocator,
+    table_id: int,
+    columns: list[FlattenedColumn],
+    partition_columns: list[str],
+) -> int:
+    """Register a `map_by_name` `ducklake_column_mapping` covering every column (including
+    `struct`/`list`/`map` containers, not just leaves).
+
+    Required, not optional, whenever the underlying Parquet files carry no field-ids of their own
+    -- which is the normal case for a plain Delta/Spark writer with no column mapping enabled.
+    Confirmed empirically: attaching a real DuckLake catalog that registered `map`-typed columns
+    *without* this raised a genuine DuckDB error (`'key' of MAP did not map to a value...`) reading
+    them back, even though `struct`/`list` columns happened to read back fine without it -- adding
+    the mapping fixed it. Applied unconditionally to every table (harmless for already-simple
+    schemas) rather than only when a `map` column is present, to keep behavior uniform.
+    """
+    mapping_id = alloc.alloc_catalog_id()
+    catalog.execute(
+        "INSERT INTO ducklake_column_mapping (mapping_id, table_id, type) "
+        "VALUES (?, ?, 'map_by_name')",
+        (mapping_id, table_id),
+    )
+    catalog.executemany(
+        "INSERT INTO ducklake_name_mapping "
+        "(mapping_id, column_id, source_name, target_field_id, parent_column, is_partition) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        [
+            (
+                mapping_id,
+                c.column_id,
+                c.name,
+                c.column_id,
+                c.parent_column_id,
+                len(c.path) == 1 and c.name in partition_columns,
+            )
+            for c in columns
+        ],
+    )
+    return mapping_id
+
+
+def load_mapping_id(catalog: CatalogBackend, table_id: int) -> int | None:
+    row = catalog.fetchone(
+        "SELECT mapping_id FROM ducklake_column_mapping WHERE table_id = ?", (table_id,)
+    )
+    return row[0] if row else None
 
 
 # --- partitioning --------------------------------------------------------------------------------
@@ -253,13 +335,14 @@ def insert_data_file(
     record_count: int,
     row_id_start: int,
     partition_id: int | None,
+    mapping_id: int | None = None,
 ) -> None:
     catalog.execute(
         "INSERT INTO ducklake_data_file "
         "(data_file_id, table_id, begin_snapshot, end_snapshot, file_order, path, "
         "path_is_relative, file_format, record_count, file_size_bytes, footer_size, "
         "row_id_start, partition_id, encryption_key, mapping_id, partial_max) "
-        "VALUES (?, ?, ?, NULL, ?, ?, ?, 'parquet', ?, ?, NULL, ?, ?, NULL, NULL, NULL)",
+        "VALUES (?, ?, ?, NULL, ?, ?, ?, 'parquet', ?, ?, NULL, ?, ?, NULL, ?, NULL)",
         (
             data_file_id,
             table_id,
@@ -271,6 +354,7 @@ def insert_data_file(
             add.size,
             row_id_start,
             partition_id,
+            mapping_id,
         ),
     )
 

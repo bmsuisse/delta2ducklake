@@ -50,7 +50,7 @@ def test_copy_table_basic(tmp_path):
         table_path, table_path_rel = backend.fetchone(
             "SELECT path, path_is_relative FROM ducklake_table WHERE table_id = ?", (table_id,)
         )
-        assert table_path == table_root
+        assert table_path == table_root.rstrip("/") + "/"
         assert table_path_rel == 0
 
         (total_records, next_row_id, total_bytes) = backend.fetchone(

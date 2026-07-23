@@ -93,6 +93,13 @@ def copy_table(
         )
         path_to_id = w.path_to_column_id(columns)
 
+        # Required whenever the source Parquet has no embedded field-ids (the normal case for a
+        # plain Delta/Spark writer) -- see writer.create_name_mapping's docstring for why this
+        # isn't optional even for tables Delta itself considers columnMapping.mode == "none".
+        mapping_id = w.create_name_mapping(
+            catalog, alloc, table_id, columns, state.metadata.partition_columns
+        )
+
         partition_id = None
         if state.metadata.partition_columns:
             partition_id = w.create_partition_info(
@@ -117,7 +124,7 @@ def copy_table(
             row_id_start = next_row_id
             w.insert_data_file(
                 catalog, data_file_id, table_id, new_snapshot_id, add, record_count, row_id_start,
-                partition_id,
+                partition_id, mapping_id,
             )
 
             for leaf in iter_leaf_column_stats(schema_tree.fields, parsed_stats):
@@ -256,6 +263,7 @@ def sync_table(
         columns = w.load_columns(catalog, table_id, snapshot.snapshot_id)
         path_to_id = w.path_to_column_id(columns)
         partition_id = w.load_partition_id(catalog, table_id, snapshot.snapshot_id)
+        mapping_id = w.load_mapping_id(catalog, table_id)
 
         leaf_types = {
             leaf.path: leaf.delta_type for leaf in iter_leaf_column_stats(schema_tree.fields, None)
@@ -275,7 +283,7 @@ def sync_table(
             row_id_start = next_row_id
             w.insert_data_file(
                 catalog, data_file_id, table_id, new_snapshot_id, add, record_count, row_id_start,
-                partition_id,
+                partition_id, mapping_id,
             )
 
             for leaf in iter_leaf_column_stats(schema_tree.fields, parsed_stats):

@@ -319,3 +319,77 @@ that's not a fair byte-for-byte check.) (2) `refresh_stats(columns=["BooleanType
 backfills real bounds (`"0"`/`"1"`) for the one column this fixture's writer collected *no* stats
 for at all, without touching any other column's existing stats — the actual "Delta never collected
 this" scenario the utility exists for.
+
+## Real-DuckDB verification (`tests/test_verify_duckdb.py`) — two more bugs found
+
+Every prior test validated delta2ducklake against its own SQL queries — the same kind of
+self-referential check that let the earlier log-replay bug slip through unit tests until a *real*
+fixture's content contradicted it. So before calling phase 1 done, a `copy_table()`-produced
+catalog was read back through DuckDB's actual `ducklake` extension (`INSTALL ducklake; ATTACH
+'ducklake:sqlite:...'`) and cross-checked row-for-row (`EXCEPT` both directions, not just counts)
+against the same source table read through DuckDB's actual `delta` extension (`delta_scan`) — an
+independent reader on both sides of the comparison, neither of them code this project wrote. This
+immediately surfaced two real bugs that 85 passing self-consistent tests had completely missed:
+
+**Bug 1 — `list`/`map` columns need child rows, or DuckDB's reader crashes.** The first version of
+`flatten_schema()` gave `struct` columns their field children but left `list`/`map` columns as bare
+leaf-like rows with no children at all (reasoned at the time to be an acceptable gap since "phase 1
+doesn't need per-element stats"). Attaching a real catalog built that way and reading a `map`
+column crashed DuckDB with an internal assertion failure (`Attempting to dereference an optional
+pointer that is not set`) inside `DuckLakeCatalog::LoadSchemaForSnapshot` — not a graceful error, a
+crash, on ordinary data. Fixed by synthesizing the child columns DuckLake's own nested-type model
+expects: a `list` gets one child named `"element"`, a `map` gets two named `"key"`/`"value"`
+(exactly the naming used in DuckLake's own `data_types.md` nested-type example), recursively for
+arbitrarily nested combinations (list-of-list-of-struct, map-of-list, etc). `struct`/`list` columns
+turned out to already read back correctly even *before* this fix (confirmed by testing each nested
+column in isolation) — only `map` actually crashed — but the fix was applied uniformly since the
+schema/row-count cost of the extra rows is negligible and "some nested container types get
+children, others don't" isn't a distinction worth maintaining.
+
+**Bug 2 — `ducklake_table.path` needs a trailing slash; DuckLake does not insert a separator.**
+`create_table()` originally stored the Delta table root exactly as given (e.g.
+`".../data-reader-primitives"`, no trailing `/`). Reading a file back through the real extension
+failed with a plain `IOException: Cannot open file ".../data-reader-primitivespart-00000-...
+parquet"` — table path and relative file path concatenated with **no separator at all**. Confirmed
+against bootstrap's own convention (the "main" schema it creates is stored as `"main/"`, trailing
+slash included) and fixed by normalizing every table path to end in `/` before storing.
+
+**Bug 3 (the significant one) — `map_by_name` column mapping is not a phase-2-only concern.** After
+fixing bug 1, a *third* issue surfaced reading `map` columns specifically: a real, valid-looking
+DuckDB error (`'key' of MAP did not map to a value and the registered DEFAULT is NULL, which is not
+allowed`) — the same error you'd get from constructing a literal `MAP` with a null key in plain SQL,
+despite the underlying data being an all-NULL map column with nothing resembling a null key.
+`struct`/`list` columns read back fine without any `ducklake_column_mapping` row at all; only `map`
+broke. The working theory (confirmed by manually patching a `map_by_name` mapping into the SQLite
+catalog by hand and watching the exact same failing query succeed): Parquet's own physical
+encoding of a `MAP` always inserts an implicit `key_value` repeated-group wrapper between the map
+and its key/value children (confirmed via `parquet_schema()` on the raw file) that DuckLake's
+2-level *logical* model (map → key, value directly, matching its own documented nested-type
+example) doesn't mirror — and without either embedded Parquet field-ids (absent here, confirmed via
+`parquet_schema()`: every column shows `field_id: None`, the normal case for a plain Delta/Spark
+writer) or an explicit name-based mapping telling DuckLake how to bridge that wrapper, resolving a
+`map` column's data is ambiguous enough to produce a genuine misread, not just a missing
+optimization.
+
+This means `ducklake_column_mapping`/`ducklake_name_mapping` are **not** an optional feature that
+only matters for Delta's own `columnMapping.mode = name`/`id` (the original phase-2 scope) — they
+are required, in practice, for essentially every table converted from a plain Delta/Spark writer,
+because such writers don't embed Parquet field-ids by default. Phase 1 now creates one
+`map_by_name` mapping unconditionally for every table `create_table()` registers (covering every
+column, container and leaf alike, with `is_partition` set for partition columns per the spec),
+regardless of whether the source Delta table itself uses column mapping — that Delta-side feature
+(physical vs. logical *names* differing, per Delta's own `delta.columnMapping.mode`) remains a
+distinct, separate phase-2 concern layered on top of this baseline mechanism, not a prerequisite
+for it.
+
+**End state**: `parquet-all-types` (13 primitive types + nested struct/list/map/map-of-list) now
+matches `delta_scan` **byte-for-byte** across all 20 columns and 200 rows (`EXCEPT` both directions
+→ 0 rows), including stats-based file pruning returning identical filtered results. 12 fixtures
+covering flat/wide primitives, nested types, partitioning, multi-file tables, decimals, and all
+three checkpoint shapes (classic multi-part, V2 JSON, V2 Parquet) pass the same row-for-row check
+in `tests/test_verify_duckdb.py`, with one narrow, documented exception: `data-reader-partition-
+values`' 12-level nested Hive path (one level being a colon-containing timestamp) trips a
+`delta_scan`-side quirk when combined into a multi-relation query — reproduced with a fresh
+connection and no ducklake catalog involved at all, so it's DuckDB's `delta` extension, not this
+project; row *count* is still checked for that fixture, and partitioning logic itself has its own
+dedicated non-DuckDB unit test.
