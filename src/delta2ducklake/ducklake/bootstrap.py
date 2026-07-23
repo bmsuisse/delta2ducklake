@@ -28,6 +28,7 @@ def bootstrap_catalog(config: CatalogConfig, data_path: str) -> None:
     con = duckdb.connect()
     try:
         con.sql("INSTALL ducklake")
+        config.prepare_attach(con)
         con.sql(f"ATTACH '{attach_url}' AS bootstrap_target (DATA_PATH '{quoted_data_path}')")
     finally:
         con.close()

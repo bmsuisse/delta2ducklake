@@ -542,3 +542,60 @@ the real DuckDB `ducklake` extension (0 rows differing either direction via `EXC
 `test_verify_duckdb.py`. This means two entirely independent deletion-vector implementations (DuckDB
 's own `delta_scan` DV logic, and this project's hand-rolled RoaringBitmap decoder + positional-
 delete-file writer) agree exactly on which rows survive.
+
+## Additional catalog backends: DuckDB file, Entra ID (Postgres), Quack
+
+**`DuckDBCatalogConfig`/`DuckDBCatalog`** — a local `.duckdb`/`.ducklake` file is DuckLake's own
+native catalog format (no `sqlite:`/`postgres:` scheme prefix in the ATTACH string). Confirmed by
+inspection that DuckDB's `ducklake` extension, given a bare path, just uses a plain DuckDB database
+file to hold the `ducklake_*` metadata tables — connecting to that same file directly via
+`duckdb.connect(path)` exposes those tables in the `main` schema, exactly like `SQLiteCatalog`
+bypasses the extension and talks to the raw SQLite file directly. One wrinkle: a plain
+`duckdb.connect()` autocommits every statement immediately by default (same behavior already found
+for `QuackCatalog`), so `DuckDBCatalog` opens an explicit `BEGIN TRANSACTION` after connecting and
+re-opens one after every commit/rollback. `DuckDBCatalogConfig.path` also accepts an already-open
+`duckdb.DuckDBPyConnection` directly (for in-memory testing or connection reuse) — in that case
+`DuckDBCatalog` doesn't open or close the connection itself, since the caller owns its lifecycle;
+`attach_url()` (only used by `bootstrap_catalog()`, which needs a real path to ATTACH from a
+*separate* connection) raises `ValueError` if given a connection instead of a path.
+
+**Entra ID (Azure AD) auth for `PostgresCatalogConfig`** — mirrors `bmsuisse/pgdevkit`'s pattern
+exactly: fetch an AAD access token via `azure-identity` (`DefaultAzureCredential` or
+`ManagedIdentityCredential`) and use it directly as the Postgres password, since Azure Database for
+PostgreSQL accepts AAD tokens as passwords for a matching Entra-mapped user. `entra_user`/
+`managed_identity` fields added to `PostgresCatalogConfig`; a fresh token is fetched on every
+`connect()`/`attach_url()` call (not cached on the frozen dataclass) since tokens expire, using
+`psycopg.conninfo.make_conninfo()` to overlay `user`/`password` onto the base DSN without needing
+to hand-parse libpq keyword=value syntax. Credential objects themselves *are* process-cached
+(module-level globals in `azure_auth.py`), matching pgdevkit's approach, so repeated token refreshes
+don't re-probe the credential chain. Gated behind the existing `delta2ducklake[azure]` extra (added
+`azure-identity`).
+
+**`QuackCatalogConfig`/`QuackCatalog`** — [Quack](https://duckdb.org/quack/) is DuckDB's
+experimental (as of v1.5.5) client-server RPC protocol: `CALL quack_serve('quack:host:port',
+token=...)` on a server, `ATTACH 'quack:host:port' AS x` on a client. DuckLake is being integrated
+with it, so `ATTACH 'ducklake:quack:host:port' AS x (DATA_PATH ...)` works for bootstrapping — added
+`prepare_attach()` to every `CatalogConfig` (a no-op for DuckDB-file/SQLite/Postgres) so
+`bootstrap_catalog()` can `INSTALL`/`LOAD quack` and register the auth secret on its throwaway
+connection before the ATTACH. `QuackCatalog` needs the same explicit-transaction treatment as
+`DuckDBCatalog` (plain `duckdb.connect()` autocommits by default).
+
+**Known limitation, confirmed by direct testing against a real running `quack_serve()` instance**:
+tables reached via a raw `ATTACH 'quack:...' AS remote` only support `INSERT`/`SELECT`. Both
+`UPDATE` and `DELETE` fail at the binder level:
+```
+UPDATE ducklake_metadata SET value = 'x' WHERE key = 'version'  -- Binder Error: Can only update base table
+DELETE FROM ducklake_metadata WHERE key = 'nonexistent_key_xyz'  -- Binder Error: Can only delete from base table
+```
+reproduced consistently, isolated into separate `BEGIN`/`ROLLBACK` blocks per statement (running
+multiple DML statements plus a `SHOW TABLES` in one transaction separately hit `NotImplementedException:
+Multiple streaming scans ... not currently supported`, suggesting Quack's remote-table access goes
+through some kind of streaming-scan abstraction the DuckDB binder doesn't yet recognize as an
+updatable/deletable base table). Since `convert._write_bookkeeping()` uses `DELETE`+`INSERT` on
+*every* `copy_table()`/`sync_table()` call, and `sync_table()` retires removed files via `UPDATE
+ducklake_data_file SET end_snapshot = ...`, **neither function currently works against a
+Quack-backed catalog** — this is a hard blocker stemming from the experimental protocol's current
+DML support, not a bug in this package. Shipped anyway (per explicit decision): `bootstrap_catalog()`
+and read-only queries already work today, and this should start working for writes with no code
+changes here once Quack gains `UPDATE`/`DELETE` support. Documented prominently in both classes'
+docstrings and in the README so users don't discover this the hard way.

@@ -10,19 +10,25 @@ from delta2ducklake.convert import copy_table, sync_table
 from delta2ducklake.ducklake.bootstrap import bootstrap_catalog
 from delta2ducklake.ducklake.catalog import (
     CatalogConfig,
+    DuckDBCatalogConfig,
     PostgresCatalogConfig,
+    QuackCatalogConfig,
     SQLiteCatalogConfig,
 )
 from delta2ducklake.ducklake.stats_refresh import refresh_stats
 
 
 def _parse_catalog(spec: str) -> CatalogConfig:
+    if spec.startswith("duckdb:"):
+        return DuckDBCatalogConfig(spec.removeprefix("duckdb:"))
     if spec.startswith("sqlite:"):
         return SQLiteCatalogConfig(spec.removeprefix("sqlite:"))
     if spec.startswith("postgres:"):
         return PostgresCatalogConfig(spec.removeprefix("postgres:"))
+    if spec.startswith("quack:"):
+        return QuackCatalogConfig(spec.removeprefix("quack:"))
     raise argparse.ArgumentTypeError(
-        f"--catalog must start with 'sqlite:' or 'postgres:', got {spec!r}"
+        f"--catalog must start with 'duckdb:', 'sqlite:', 'postgres:', or 'quack:', got {spec!r}"
     )
 
 
@@ -31,9 +37,10 @@ def _add_catalog_arg(parser: argparse.ArgumentParser) -> None:
         "--catalog",
         required=True,
         type=_parse_catalog,
-        metavar="sqlite:<path>|postgres:<libpq DSN>",
-        help="DuckLake catalog location, e.g. 'sqlite:./catalog.db' or "
-        "'postgres:host=localhost dbname=mydb user=me password=...'",
+        metavar="duckdb:<path>|sqlite:<path>|postgres:<libpq DSN>|quack:<host:port>",
+        help="DuckLake catalog location, e.g. 'duckdb:./catalog.ducklake', 'sqlite:./catalog.db', "
+        "'postgres:host=localhost dbname=mydb user=me password=...', or 'quack:localhost:9494' "
+        "(quack: is experimental -- see README for its current limitations)",
     )
     parser.add_argument(
         "--entra-user",
@@ -41,6 +48,12 @@ def _add_catalog_arg(parser: argparse.ArgumentParser) -> None:
         metavar="USER",
         help="Postgres catalog only: authenticate to Azure Database for PostgreSQL as this user "
         "with an Entra ID token instead of a static password (requires delta2ducklake[azure])",
+    )
+    parser.add_argument(
+        "--quack-token",
+        default=None,
+        metavar="TOKEN",
+        help="Quack catalog only: shared secret token configured on the quack_serve(...) side",
     )
     parser.add_argument(
         "--managed-identity",
@@ -52,13 +65,19 @@ def _add_catalog_arg(parser: argparse.ArgumentParser) -> None:
 
 def _resolve_catalog(args: argparse.Namespace) -> CatalogConfig:
     catalog = args.catalog
-    if args.entra_user is None:
-        return catalog
-    if not isinstance(catalog, PostgresCatalogConfig):
-        raise argparse.ArgumentTypeError("--entra-user only applies to a 'postgres:' --catalog")
-    return PostgresCatalogConfig(
-        dsn=catalog.dsn, entra_user=args.entra_user, managed_identity=args.managed_identity
-    )
+    if args.entra_user is not None:
+        if not isinstance(catalog, PostgresCatalogConfig):
+            raise argparse.ArgumentTypeError(
+                "--entra-user only applies to a 'postgres:' --catalog"
+            )
+        catalog = PostgresCatalogConfig(
+            dsn=catalog.dsn, entra_user=args.entra_user, managed_identity=args.managed_identity
+        )
+    if args.quack_token is not None:
+        if not isinstance(catalog, QuackCatalogConfig):
+            raise argparse.ArgumentTypeError("--quack-token only applies to a 'quack:' --catalog")
+        catalog = QuackCatalogConfig(endpoint=catalog.endpoint, token=args.quack_token)
+    return catalog
 
 
 def _add_table_args(parser: argparse.ArgumentParser) -> None:

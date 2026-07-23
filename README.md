@@ -14,7 +14,8 @@ Status: early development, not yet published to PyPI.
 - Deletion vectors, converted to DuckLake positional delete files
 - A standalone `refresh_stats()` utility to (re)compute stats for any DuckLake table's columns
   (useful since Delta's `dataSkippingNumIndexedCols` often leaves trailing columns with none)
-- Catalog backends: SQLite, PostgreSQL
+- Catalog backends: a local DuckDB database file (DuckLake's own native format), SQLite,
+  PostgreSQL (including Entra ID/Azure AD token auth for Azure Database for PostgreSQL)
 - Storage backends: local filesystem, Azure Blob/ADLS Gen2 (`delta2ducklake[azure]`)
 
 See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) for design notes, protocol details pinned
@@ -33,14 +34,15 @@ uv add "delta2ducklake[azure]" ...       # if your Delta table or catalog lives 
 ## Quick start
 
 A DuckLake catalog needs to be **bootstrapped** once (creates its metadata schema), then tables
-are registered into it with `copy_table()` and kept up to date with `sync_table()`:
+are registered into it with `copy_table()` and kept up to date with `sync_table()`. The simplest
+catalog is a local DuckDB database file — DuckLake's own native format:
 
 ```python
 from delta2ducklake.ducklake.bootstrap import bootstrap_catalog
-from delta2ducklake.ducklake.catalog import SQLiteCatalogConfig
+from delta2ducklake.ducklake.catalog import DuckDBCatalogConfig
 from delta2ducklake.convert import copy_table, sync_table
 
-catalog = SQLiteCatalogConfig("/abs/path/to/catalog.sqlite")
+catalog = DuckDBCatalogConfig("/abs/path/to/catalog.ducklake")
 bootstrap_catalog(catalog, data_path="/abs/path/to/ducklake_data/")  # one-time; safe to re-run
 
 # Register a Delta table's current state as a new DuckLake table.
@@ -48,6 +50,21 @@ copy_table("/path/to/my_delta_table", catalog, "my_table")
 
 # ... later, after the Delta table has new commits ...
 sync_table("/path/to/my_delta_table", catalog, "my_table")
+```
+
+`DuckDBCatalogConfig` also accepts an already-open `duckdb.DuckDBPyConnection` instead of a path
+(e.g. for in-memory testing, or when you already manage a connection to the catalog file) —
+`connect()` reuses it as-is and `close()` leaves it open, since the caller owns its lifecycle.
+`bootstrap_catalog()` still needs a real path (it ATTACHes from a separate connection), so
+bootstrap first, then wrap a connection to the same file if you want to reuse one.
+
+Or use a SQLite file:
+
+```python
+from delta2ducklake.ducklake.catalog import SQLiteCatalogConfig
+
+catalog = SQLiteCatalogConfig("/abs/path/to/catalog.sqlite")
+bootstrap_catalog(catalog, data_path="/abs/path/to/ducklake_data/")
 ```
 
 > **Use absolute paths.** DuckDB's own `ducklake` extension pins a catalog to the exact
@@ -78,6 +95,25 @@ catalog = PostgresCatalogConfig(
     managed_identity=False,      # True to use ManagedIdentityCredential instead of DefaultAzureCredential
 )
 ```
+
+There's also experimental support for [Quack](https://duckdb.org/quack/), DuckDB's client-server RPC
+protocol, letting a remote DuckDB instance act as the catalog:
+
+```python
+from delta2ducklake.ducklake.catalog import QuackCatalogConfig
+
+catalog = QuackCatalogConfig("localhost:9494", token="...")  # matches quack_serve(...) on the server
+bootstrap_catalog(catalog, data_path="/abs/path/to/ducklake_data/")
+```
+
+> **Known limitation:** as of DuckDB v1.5.5, tables reached via Quack's remote attach only support
+> `INSERT`/`SELECT` — `UPDATE` and `DELETE` both fail with `Binder Error: Can only update/delete
+> from base table` (confirmed against a real `quack_serve()` instance). Since `copy_table()` writes
+> its bookkeeping via `DELETE`+`INSERT` and `sync_table()` retires removed files via `UPDATE`,
+> **neither currently works against a Quack-backed catalog** — only `bootstrap_catalog()` and raw
+> read-only queries do. This is a limitation of the experimental protocol itself, not something
+> delta2ducklake can work around; it should start working with no code changes here once Quack's
+> DML support matures.
 
 Then query the result with DuckDB directly:
 

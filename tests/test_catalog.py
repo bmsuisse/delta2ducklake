@@ -1,5 +1,11 @@
+import pytest
+
 from delta2ducklake.ducklake.bootstrap import bootstrap_catalog
-from delta2ducklake.ducklake.catalog import PostgresCatalogConfig, SQLiteCatalogConfig
+from delta2ducklake.ducklake.catalog import (
+    DuckDBCatalogConfig,
+    PostgresCatalogConfig,
+    SQLiteCatalogConfig,
+)
 
 
 def test_bootstrap_creates_all_28_tables(tmp_path):
@@ -131,6 +137,86 @@ def test_sqlite_catalog_executemany(tmp_path):
         assert rows == {"k1": "v1", "k2": "v2"}
     finally:
         backend.close()
+
+
+def test_duckdb_catalog_bootstrap_and_roundtrip(tmp_path):
+    catalog_path = tmp_path / "catalog.ducklake"
+    data_path = str(tmp_path / "data") + "/"
+    config = DuckDBCatalogConfig(str(catalog_path))
+
+    bootstrap_catalog(config, data_path)
+    assert config.attach_url() == f"ducklake:{catalog_path}"
+
+    backend = config.connect()
+    try:
+        tables = {
+            r[0]
+            for r in backend.fetchall(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'"
+            )
+        }
+        assert "ducklake_data_file" in tables
+        assert "ducklake_column_mapping" in tables
+
+        backend.execute(
+            "INSERT INTO ducklake_metadata (key, value) VALUES (?, ?)", ("custom_key", "42")
+        )
+        backend.commit()
+        assert backend.fetchone(
+            "SELECT value FROM ducklake_metadata WHERE key = ?", ("custom_key",)
+        ) == ("42",)
+    finally:
+        backend.close()
+
+
+def test_duckdb_catalog_rollback(tmp_path):
+    catalog_path = tmp_path / "catalog.ducklake"
+    config = DuckDBCatalogConfig(str(catalog_path))
+    bootstrap_catalog(config, str(tmp_path / "data") + "/")
+
+    backend = config.connect()
+    try:
+        backend.execute(
+            "INSERT INTO ducklake_metadata (key, value) VALUES (?, ?)", ("rolled_back", "x")
+        )
+        backend.rollback()
+        assert (
+            backend.fetchone(
+                "SELECT value FROM ducklake_metadata WHERE key = ?", ("rolled_back",)
+            )
+            is None
+        )
+    finally:
+        backend.close()
+
+
+def test_duckdb_catalog_config_reuses_preexisting_connection(tmp_path):
+    import duckdb
+
+    catalog_path = tmp_path / "catalog.ducklake"
+    data_path = str(tmp_path / "data") + "/"
+    bootstrap_catalog(DuckDBCatalogConfig(str(catalog_path)), data_path)
+
+    conn = duckdb.connect(str(catalog_path))
+    config = DuckDBCatalogConfig(conn)
+    with pytest.raises(ValueError, match="preexisting connection"):
+        config.attach_url()
+
+    backend = config.connect()
+    try:
+        backend.execute(
+            "INSERT INTO ducklake_metadata (key, value) VALUES (?, ?)", ("custom_key", "42")
+        )
+        backend.commit()
+        assert backend.fetchone(
+            "SELECT value FROM ducklake_metadata WHERE key = ?", ("custom_key",)
+        ) == ("42",)
+    finally:
+        backend.close()
+
+    # close() must not have closed the caller-owned connection.
+    assert conn.execute("SELECT 1").fetchone() == (1,)
+    conn.close()
 
 
 def test_postgres_catalog_config_entra_user_overrides_credentials(monkeypatch):

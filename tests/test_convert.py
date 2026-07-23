@@ -6,7 +6,7 @@ import pytest
 
 from delta2ducklake.convert import copy_table, sync_table
 from delta2ducklake.ducklake.bootstrap import bootstrap_catalog
-from delta2ducklake.ducklake.catalog import SQLiteCatalogConfig
+from delta2ducklake.ducklake.catalog import DuckDBCatalogConfig, SQLiteCatalogConfig
 
 FIXTURES = Path(__file__).parent / "fixtures" / "delta-io"
 
@@ -78,6 +78,28 @@ def test_copy_table_basic(tmp_path):
         assert _column_stats("BooleanType") == (1, None, None)
     finally:
         backend.close()
+
+
+def test_copy_table_against_duckdb_file_catalog(tmp_path):
+    """DuckDB's own native catalog format (no sqlite:/postgres: scheme) -- unlike Quack, a plain
+    local .duckdb/.ducklake file supports the full read/write pattern copy_table/sync_table need."""
+    config = DuckDBCatalogConfig(str(tmp_path / "catalog.ducklake"))
+    bootstrap_catalog(config, str(tmp_path / "data") + "/")
+    table_root = str(FIXTURES / "parquet-all-types")
+
+    copy_table(table_root, config, "all_types")
+
+    con = duckdb.connect()
+    try:
+        con.sql("INSTALL ducklake")
+        con.sql(
+            f"ATTACH 'ducklake:{tmp_path / 'catalog.ducklake'}' AS dl "
+            f"(DATA_PATH '{tmp_path / 'data'}/')"
+        )
+        (count,) = con.sql("SELECT count(*) FROM dl.all_types").fetchone()
+        assert count > 0
+    finally:
+        con.close()
 
 
 def test_copy_table_raises_if_table_already_exists(tmp_path):
