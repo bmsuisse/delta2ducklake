@@ -68,24 +68,24 @@ def test_copy_table_matches_delta_scan_row_for_row(duckdb_con, tmp_path, fixture
     duckdb_con.sql(
         f"ATTACH '{config.attach_url()}' AS {schema_name} (DATA_PATH '{data_path}', READ_ONLY)"
     )
+    try:
+        dl_count = duckdb_con.sql(f"SELECT count(*) FROM {schema_name}.t").fetchone()[0]
+        delta_count = duckdb_con.sql(
+            f"SELECT count(*) FROM delta_scan('{table_root}')"
+        ).fetchone()[0]
+        assert dl_count == delta_count, f"{fixture_name}: row count mismatch"
 
-    dl_count = duckdb_con.sql(f"SELECT count(*) FROM {schema_name}.t").fetchone()[0]
-    delta_count = duckdb_con.sql(
-        f"SELECT count(*) FROM delta_scan('{table_root}')"
-    ).fetchone()[0]
-    assert dl_count == delta_count, f"{fixture_name}: row count mismatch"
+        if fixture_name in _SKIP_ROW_CONTENT_CHECK:
+            return
 
-    if fixture_name in _SKIP_ROW_CONTENT_CHECK:
-        return
-
-    q_dl = f"SELECT * FROM {schema_name}.t"
-    q_delta = f"SELECT * FROM delta_scan('{table_root}')"
-    only_in_dl = duckdb_con.sql(f"({q_dl}) EXCEPT ({q_delta})").fetchall()
-    only_in_delta = duckdb_con.sql(f"({q_delta}) EXCEPT ({q_dl})").fetchall()
-    assert only_in_dl == [], f"{fixture_name}: rows only in ducklake catalog: {only_in_dl[:3]}"
-    assert only_in_delta == [], f"{fixture_name}: rows only in delta_scan: {only_in_delta[:3]}"
-
-    duckdb_con.sql(f"DETACH {schema_name}")
+        q_dl = f"SELECT * FROM {schema_name}.t"
+        q_delta = f"SELECT * FROM delta_scan('{table_root}')"
+        only_in_dl = duckdb_con.sql(f"({q_dl}) EXCEPT ({q_delta})").fetchall()
+        only_in_delta = duckdb_con.sql(f"({q_delta}) EXCEPT ({q_dl})").fetchall()
+        assert only_in_dl == [], f"{fixture_name}: rows only in ducklake catalog: {only_in_dl[:3]}"
+        assert only_in_delta == [], f"{fixture_name}: rows only in delta_scan: {only_in_delta[:3]}"
+    finally:
+        duckdb_con.sql(f"DETACH {schema_name}")
 
 
 def test_stats_enable_file_pruning_matching_delta_scan_results(duckdb_con, tmp_path):
@@ -102,12 +102,12 @@ def test_stats_enable_file_pruning_matching_delta_scan_results(duckdb_con, tmp_p
     duckdb_con.sql(
         f"ATTACH '{config.attach_url()}' AS dl_pruning (DATA_PATH '{data_path}', READ_ONLY)"
     )
-
-    q_dl = "SELECT as_int, as_string FROM dl_pruning.t WHERE as_int > 0"
-    q_delta = f"SELECT as_int, as_string FROM delta_scan('{table_root}') WHERE as_int > 0"
-    only_in_dl = duckdb_con.sql(f"({q_dl}) EXCEPT ({q_delta})").fetchall()
-    only_in_delta = duckdb_con.sql(f"({q_delta}) EXCEPT ({q_dl})").fetchall()
-    assert only_in_dl == []
-    assert only_in_delta == []
-
-    duckdb_con.sql("DETACH dl_pruning")
+    try:
+        q_dl = "SELECT as_int, as_string FROM dl_pruning.t WHERE as_int > 0"
+        q_delta = f"SELECT as_int, as_string FROM delta_scan('{table_root}') WHERE as_int > 0"
+        only_in_dl = duckdb_con.sql(f"({q_dl}) EXCEPT ({q_delta})").fetchall()
+        only_in_delta = duckdb_con.sql(f"({q_delta}) EXCEPT ({q_dl})").fetchall()
+        assert only_in_dl == []
+        assert only_in_delta == []
+    finally:
+        duckdb_con.sql("DETACH dl_pruning")

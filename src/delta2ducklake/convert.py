@@ -264,6 +264,15 @@ def sync_table(
         path_to_id = w.path_to_column_id(columns)
         partition_id = w.load_partition_id(catalog, table_id, snapshot.snapshot_id)
         mapping_id = w.load_mapping_id(catalog, table_id)
+        if mapping_id is None:
+            # Every table copy_table() creates gets a map_by_name mapping (required for map
+            # columns to read back correctly, see writer.create_name_mapping's docstring) -- a
+            # missing one means this table wasn't created by copy_table(), and silently
+            # registering new files with mapping_id=NULL would reproduce that same read failure.
+            raise ValueError(
+                f"Table {schema_name}.{table_name} has no ducklake_column_mapping row -- it "
+                "wasn't created by copy_table(), so sync_table() can't safely add files to it"
+            )
 
         leaf_types = {
             leaf.path: leaf.delta_type for leaf in iter_leaf_column_stats(schema_tree.fields, None)

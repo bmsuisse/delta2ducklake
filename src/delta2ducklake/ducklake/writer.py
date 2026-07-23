@@ -335,7 +335,7 @@ def insert_data_file(
     record_count: int,
     row_id_start: int,
     partition_id: int | None,
-    mapping_id: int | None = None,
+    mapping_id: int,
 ) -> None:
     catalog.execute(
         "INSERT INTO ducklake_data_file "
