@@ -611,3 +611,15 @@ because nothing has been written yet at that point in the function, so handing o
 independently-connected `copy_table()` call has no partial-state cleanup to worry about.
 `copy_table()` itself is unchanged and still raises if the table already exists, for callers that
 specifically want that hard failure instead of an update.
+
+## Optional `credential` for non-public Azure storage accounts
+
+`AzureStorageBackend` previously only ever constructed `BlobServiceClient(account_url,
+credential=None)`, which only works against a publicly-readable container -- there was no way for
+a caller to authenticate against a private storage account at all. Added an optional `credential`
+parameter, threaded through `get_storage_backend()` → `copy_table()`/`sync_table()` (and the
+internal `_register_deletion_vector()` write path, which needed the same credential for the
+catalog's own `data_path`) so callers can pass any `azure.core.credentials.TokenCredential` (e.g.
+`DefaultAzureCredential`, `ManagedIdentityCredential`, or a Databricks Unity Catalog service
+credential obtained via `dbutils.credentials.getServiceCredentialsProvider(...)`). Defaults to
+`None` everywhere, so existing callers relying on anonymous access are unaffected.

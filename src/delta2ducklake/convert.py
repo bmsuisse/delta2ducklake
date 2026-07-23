@@ -52,6 +52,7 @@ def _register_deletion_vector(
     delta_table_root: str,
     add,
     ducklake_data_path: str,
+    credential=None,
 ) -> None:
     """Resolve a Delta deletion vector into row positions, write a DuckLake positional-delete
     Parquet file for it, and register it against `data_file_id`.
@@ -63,7 +64,7 @@ def _register_deletion_vector(
     matched_file_path = storage.resolve(delta_table_root, add.path)
     parquet_bytes = w.build_positional_delete_parquet(matched_file_path, positions)
 
-    ducklake_storage = get_storage_backend(ducklake_data_path)
+    ducklake_storage = get_storage_backend(ducklake_data_path, credential=credential)
     dest_path = (
         f"{ducklake_data_path.rstrip('/')}/{schema_name}/{table_name}/{uuid.uuid4()}-delete.parquet"
     )
@@ -110,12 +111,18 @@ def copy_table(
     *,
     schema_name: str = "main",
     end_version: int | None = None,
+    credential=None,
 ) -> int:
     """Register a Delta table's currently-active files (or its state as of `end_version`) into a
     brand-new DuckLake table. Fails if `table_name` already exists in `schema_name` -- call
     `sync_table()` to update an existing one instead. Returns the new `table_id`.
+
+    `credential` (e.g. an `azure.core.credentials.TokenCredential`) is forwarded to the storage
+    backend for both reading the Delta table and writing any DuckLake deletion-vector files --
+    needed whenever `delta_table_root`/the catalog's `data_path` live on a non-public Azure
+    storage account.
     """
-    storage = get_storage_backend(delta_table_root)
+    storage = get_storage_backend(delta_table_root, credential=credential)
     state = load_table_state(
         storage, delta_table_root, end_version=end_version, allow_column_mapping=True,
         allow_deletion_vectors=True,
@@ -196,6 +203,7 @@ def copy_table(
                 _register_deletion_vector(
                     catalog, alloc, schema_name, table_name, new_snapshot_id, table_id,
                     data_file_id, storage, delta_table_root, add, ducklake_data_path,
+                    credential=credential,
                 )
 
             total_records += record_count
@@ -230,6 +238,7 @@ def sync_table(
     *,
     schema_name: str = "main",
     end_version: int | None = None,
+    credential=None,
 ) -> int:
     """Bring a DuckLake table up to date with the Delta table's currently-active files (or its
     state as of `end_version`): newly-added files are registered, files no longer active are
@@ -239,10 +248,12 @@ def sync_table(
     instead of failing -- sync_table() is safe to call unconditionally, whether or not a previous
     copy_table()/sync_table() call has happened. Returns the table_id.
 
+    `credential` is forwarded to the storage backend exactly as in `copy_table()`.
+
     Raises `NotImplementedError` if the Delta table's schema has changed since it was registered --
     schema evolution during sync is not yet supported.
     """
-    storage = get_storage_backend(delta_table_root)
+    storage = get_storage_backend(delta_table_root, credential=credential)
     state = load_table_state(
         storage, delta_table_root, end_version=end_version, allow_column_mapping=True,
         allow_deletion_vectors=True,
@@ -265,7 +276,7 @@ def sync_table(
             catalog.rollback()
             return copy_table(
                 delta_table_root, catalog_config, table_name,
-                schema_name=schema_name, end_version=end_version,
+                schema_name=schema_name, end_version=end_version, credential=credential,
             )
 
         bookkeeping = _read_bookkeeping(catalog, table_id)
@@ -383,6 +394,7 @@ def sync_table(
                 _register_deletion_vector(
                     catalog, alloc, schema_name, table_name, new_snapshot_id, table_id,
                     data_file_id, storage, delta_table_root, add, ducklake_data_path,
+                    credential=credential,
                 )
 
             added_records += record_count

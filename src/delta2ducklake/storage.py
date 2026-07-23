@@ -170,11 +170,15 @@ class AzureStorageBackend:
             raise StorageError(str(e)) from e
 
 
-def get_storage_backend(table_root: str) -> StorageBackend:
-    """Pick a `StorageBackend` for `table_root` based on its URI scheme (or lack thereof)."""
+def get_storage_backend(table_root: str, *, credential=None) -> StorageBackend:
+    """Pick a `StorageBackend` for `table_root` based on its URI scheme (or lack thereof).
+
+    `credential` is forwarded to `AzureStorageBackend` (e.g. an `azure.core.credentials.
+    TokenCredential`) for accounts that don't allow anonymous access -- ignored for local paths.
+    """
     scheme = urlsplit(table_root).scheme
     if scheme in ("", "file"):
         return LocalStorageBackend()
     if scheme in ("https", "abfss", "abfs"):
-        return AzureStorageBackend()
+        return AzureStorageBackend(credential=credential)
     raise ValueError(f"Unsupported storage scheme {scheme!r} for path {table_root!r}")
