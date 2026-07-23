@@ -1,6 +1,6 @@
 [project]
 name = "delta2ducklake"
-version = "0.1.0"
+version = "0.1.1"
 description = "Register Delta Lake tables into a DuckLake catalog without copying the underlying Parquet data"
 readme = "README.md"
 license = "MIT"

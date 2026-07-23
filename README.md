@@ -22,6 +22,10 @@ See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) for design notes, protoco
 down against real fixtures, and known limitations (e.g. DuckDB's own `ducklake` reader can't
 materialize partition column values for tables whose physical layout isn't Hive-style).
 
+Ships an [Agent Skill](https://code.claude.com/docs/en/skills) at
+`delta2ducklake/skills/delta2ducklake/SKILL.md` (included in the installed package) so AI coding
+assistants pick up correct usage automatically once this package is a project dependency.
+
 ## Install
 
 Not yet on PyPI — for now, install from a local clone:
