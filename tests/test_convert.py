@@ -4,6 +4,7 @@ from pathlib import Path
 import duckdb
 import pytest
 
+from delta2ducklake import convert
 from delta2ducklake.convert import copy_table, sync_table
 from delta2ducklake.ducklake.bootstrap import bootstrap_catalog
 from delta2ducklake.ducklake.catalog import DuckDBCatalogConfig, SQLiteCatalogConfig
@@ -76,6 +77,40 @@ def test_copy_table_basic(tmp_path):
         # BooleanType/BinaryType get no min/max from this writer at all -- must stay NULL, not
         # some made-up default.
         assert _column_stats("BooleanType") == (1, None, None)
+    finally:
+        backend.close()
+
+
+def test_copy_table_stores_table_path_through_to_duckdb_uri(tmp_path, monkeypatch):
+    """`ducklake_table.path` is read back later by DuckDB's own `ducklake`+`azure` extensions, not
+    by delta2ducklake -- so `copy_table` must run it through `to_duckdb_uri` (which rewrites a
+    Databricks-style `abfss://container@account...` root into DuckDB's account-first form) rather
+    than storing whatever `delta_table_root` the caller passed in verbatim. Rather than re-deriving
+    the rewrite rules (already covered in test_storage.py), this stubs `to_duckdb_uri` with a spy to
+    confirm `copy_table` actually calls it and stores *its* return value, not the raw table root.
+    """
+    calls = []
+
+    def fake_to_duckdb_uri(path):
+        calls.append(path)
+        return "abfss://myaccount.dfs.core.windows.net/mycontainer/rewritten"
+
+    monkeypatch.setattr(convert, "to_duckdb_uri", fake_to_duckdb_uri)
+
+    config = _fresh_catalog(tmp_path)
+    table_root = str(FIXTURES / "parquet-all-types")
+
+    table_id = copy_table(table_root, config, "all_types")
+
+    assert calls == [table_root]
+
+    backend = config.connect()
+    try:
+        table_path, table_path_rel = backend.fetchone(
+            "SELECT path, path_is_relative FROM ducklake_table WHERE table_id = ?", (table_id,)
+        )
+        assert table_path == "abfss://myaccount.dfs.core.windows.net/mycontainer/rewritten/"
+        assert table_path_rel == 0
     finally:
         backend.close()
 

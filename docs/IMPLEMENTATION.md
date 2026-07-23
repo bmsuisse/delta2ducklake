@@ -37,6 +37,15 @@ actual filesystem/blob path.
 or `abfss://<container>@<account>.dfs.core.windows.net/<path>` (ADLS Gen2) — both are normalized to
 the same blob container client since they address the same underlying storage.
 
+`to_duckdb_uri(path)` handles a separate concern: Databricks/Spark hand out that same `abfss://`
+form with the *container* in the netloc (`abfss://container@account.dfs.core.windows.net/...`), but
+DuckDB's own `azure` extension only understands the *account* in the netloc
+(`abfss://account.dfs.core.windows.net/container/...`). `copy_table` runs `delta_table_root` through
+this before storing it as `ducklake_table.path`, since that value is read back later by DuckDB
+itself (via `ducklake`+`azure`), not by delta2ducklake's own `AzureStorageBackend` (which parses both
+forms fine and is left untouched everywhere else — reading the source table, the bookkeeping
+source-path check, etc.).
+
 ## delta/actions.py
 
 Frozen dataclasses for the action kinds we care about: `AddAction`, `RemoveAction`, `MetaData`,

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Protocol, runtime_checkable
-from urllib.parse import unquote, urlsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 
 class StorageError(Exception):
@@ -182,3 +182,27 @@ def get_storage_backend(table_root: str, *, credential=None) -> StorageBackend:
     if scheme in ("https", "abfss", "abfs"):
         return AzureStorageBackend(credential=credential)
     raise ValueError(f"Unsupported storage scheme {scheme!r} for path {table_root!r}")
+
+
+def to_duckdb_uri(path: str) -> str:
+    """Rewrite a Databricks/Spark-style ``abfss://<container>@<account>.dfs.core.windows.net/<path>``
+    URI into the form DuckDB's own `azure` extension understands: ``abfss://<account>.dfs.core.
+    windows.net/<container>/<path>`` (the account, not the container, in the netloc; confirmed
+    against DuckDB's azure extension docs, which only document the account-in-netloc form).
+
+    This matters because a Delta table root handed to `copy_table`/`sync_table` is typically lifted
+    straight from a Databricks notebook's own config -- i.e. already in Databricks' form -- and gets
+    stored verbatim as `ducklake_table.path`. That value is never touched by delta2ducklake itself
+    (which reads via `AzureStorageBackend`, parsing both forms fine); it's only resolved later by
+    DuckDB directly, when something actually queries the resulting DuckLake catalog with the real
+    `ducklake` + `azure` extensions. So it has to be in DuckDB's own URI form, not Databricks'.
+
+    Every other scheme (local, `https://`, `az://`/`azure://`, or an `abfss://` URI that's already
+    account-first with no `@`) is returned unchanged.
+    """
+    parts = urlsplit(path)
+    if parts.scheme not in ("abfss", "abfs") or "@" not in parts.netloc:
+        return path
+    container, account_host = parts.netloc.split("@", 1)
+    new_path = f"/{container}{parts.path}"
+    return urlunsplit((parts.scheme, account_host, new_path, parts.query, parts.fragment))
