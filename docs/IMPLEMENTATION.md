@@ -170,9 +170,50 @@ the best information-preserving choice given Delta doesn't tell us more.
 — reads only the Parquet footer's row-group metadata via DuckDB's `parquet_file_metadata()` table
 function, never the actual row data, confirmed against a real 200-row fixture file.
 
+## ducklake/bootstrap.py and ducklake/catalog.py
+
+**Design change from the original plan, made after empirical probing.** The plan called for
+hand-transcribing DuckLake's published bootstrap DDL script (28 `CREATE TABLE` statements) and
+running it verbatim against SQLite/Postgres. Before doing that, `INSTALL ducklake; ATTACH
+'ducklake:sqlite:...' AS x (DATA_PATH '...')` was tried directly against a real DuckDB connection
+(network access to the extension repository is available in this environment) to see exactly what
+a fresh catalog looks like — and it revealed the hand-transcribed approach would have been *wrong*
+in a subtle way: DuckDB's own SQLite writer declares `BOOLEAN` and `UUID`-typed spec columns as
+`BIGINT`/`VARCHAR` in the actual `CREATE TABLE` it emits (e.g. `ducklake_data_file.path_is_relative`
+is `BIGINT` in the real SQLite catalog, not `BOOLEAN` as the published spec script literally shows).
+Hardcoding the spec's generic script would have created a schema *shaped* like DuckLake but not
+*byte-identical* to what DuckDB itself produces and expects — a correctness risk with no upside,
+plus a maintenance burden every time the DuckLake format version bumps.
+
+So `bootstrap_catalog()` just delegates entirely to the real extension instead of shipping any DDL
+of our own: `ATTACH` against an empty/missing catalog file creates the full 28-table schema, the
+initial snapshot (`snapshot_id = 0`, `next_catalog_id = 1`), and a default `"main"`
+`ducklake_schema` row, using whatever backend-specific types the installed DuckLake version wants —
+guaranteed self-consistent with what will later read it back, and automatically correct across
+format versions since it's not a snapshot frozen in our own source. Confirmed empirically:
+re-running `ATTACH` against an already-bootstrapped catalog is a no-op (no duplicate snapshot/schema
+rows), so `bootstrap_catalog()` is safe to call unconditionally before use. This also directly
+verified the exact bootstrap `ducklake_metadata` values (`version = "1.0"`, `created_by = "DuckDB
+<hash>"`, `data_path`, `encrypted = "false"`) rather than guessing from prose.
+
+After bootstrap, all of delta2ducklake's *own* reads/writes (registering data files, stats,
+partitions — the actual value-add, since DuckDB's SQL surface has no way to register a pre-existing
+external Parquet file into a DuckLake table without copying it) go through `catalog.py`'s
+`CatalogBackend` protocol directly via the stdlib `sqlite3` module or `psycopg` (v3) — not through
+DuckDB — for full control over snapshot/file-ID bookkeeping and to avoid a DuckDB connection/locking
+dependency on the hot path. SQL is authored once using SQLite's native `?` placeholder;
+`PostgresCatalog` does a blind `?` -> `%s` string translation, safe here because delta2ducklake only
+ever runs its own static SQL templates, never SQL built from external input — so far this has been
+enough ANSI-compatible SQL that `sqlglot` hasn't been needed at all (kept as a dependency for if a
+real dialect incompatibility surfaces later, per the original plan).
+
+Postgres-backed tests are skipped unless `DELTA2DUCKLAKE_TEST_PG_DSN` is set — a Postgres cluster
+happens to be running in this dev environment already (on a nonstandard port, no known credentials
+supplied), so no attempt was made to guess into it; the skip path was exercised instead.
+
 ## Testing approach so far
 
 All tests run against real vendored fixtures (see `tests/fixtures/NOTICE` for provenance), not
 hand-rolled synthetic Delta logs — deliberately, since the log-replay bug above was only caught
 because a real fixture's actual commit-0 content contradicted the (buggy) implementation's
-behavior. `uv run pytest` — 66 passing as of this module set, 0 skipped.
+behavior. `uv run pytest` — 73 passing, 1 skipped (Postgres, no DSN configured) as of this module set.
