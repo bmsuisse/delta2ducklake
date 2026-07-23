@@ -15,9 +15,10 @@ from delta2ducklake.ducklake.catalog import SQLiteCatalogConfig
 
 FIXTURES = Path(__file__).parent / "fixtures" / "delta-io"
 
-# Fixtures with real backing Parquet files that phase 1 (no column mapping/deletion vectors)
-# supports, covering: flat/wide primitives, nested struct/list/map, partitioning, multi-file
-# tables, decimals, and all three checkpoint shapes (classic multi-part, V2 JSON, V2 Parquet).
+# Fixtures with real backing Parquet files, covering: flat/wide primitives, nested struct/list/map,
+# partitioning, multi-file tables, decimals, all three checkpoint shapes (classic multi-part, V2
+# JSON, V2 Parquet), and both column mapping modes (physical Parquet field names differing from
+# logical column names).
 FIXTURE_NAMES = [
     "parquet-all-types",
     "data-reader-partition-values",
@@ -30,6 +31,8 @@ FIXTURE_NAMES = [
     "data-reader-nested-struct",
     "data-reader-map",
     "data-reader-array-complex-objects",
+    "table-with-columnmapping-mode-name",
+    "table-with-columnmapping-mode-id",
 ]
 
 # data-reader-partition-values has a 12-level nested Hive partition path, one level of which is a
@@ -41,6 +44,16 @@ FIXTURE_NAMES = [
 # fixture's path, not something delta2ducklake produced; row-count is still checked, just not the
 # row-for-row EXCEPT comparison. Partitioning logic itself has its own dedicated unit test
 # (test_convert.py::test_copy_table_with_partitioning), including the NULL-partition-value case.
+#
+# Separately (not in this fixture list at all): a *real* Databricks-written column-mapped +
+# partitioned table (delta-rs's table_with_column_mapping) uses non-Hive-style directory names
+# ("BH"/"8v" instead of "col=value"). DuckDB's own `ducklake` reader turns out to materialize
+# partition column values by parsing the Hive path segment, not from `ducklake_file_partition_value`
+# (confirmed: opening *any* column of such a file fails, not just the partition column) -- a hard
+# requirement of the real reader that no amount of correct catalog metadata can work around without
+# physically rewriting the files (which would violate "never copy/rewrite the data"). That table's
+# catalog correctness (name mapping, partition values, stats) is instead verified directly via SQL
+# in test_column_mapping.py; see docs/IMPLEMENTATION.md for the full writeup.
 _SKIP_ROW_CONTENT_CHECK = {"data-reader-partition-values"}
 
 

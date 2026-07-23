@@ -56,27 +56,35 @@ def iter_leaf_column_stats(
     Delta (like DuckLake) recurses into `struct` sub-fields for stats but does not collect
     min/max/null-count for `list`/`map` columns or their elements, so those are skipped entirely
     (they'll still get a `ducklake_column` row elsewhere, just no stats rows).
+
+    `path` is always keyed by the *logical* field name (for consistent `column_id` resolution
+    regardless of column mapping), but the JSON lookup into `stats` uses the *physical* name
+    (`f.physical_name`) when column mapping is on -- Delta's `add.stats` keys `minValues`/
+    `maxValues`/`nullCount` by physical name in that case (confirmed against the real
+    `table_with_column_mapping` fixture), falling back to the logical name when there's no
+    mapping (`physical_name is None`, always true for a `columnMapping.mode = none` table).
     """
     min_values = (stats.min_values if stats else {}) or {}
     max_values = (stats.max_values if stats else {}) or {}
     null_counts = (stats.null_count if stats else {}) or {}
     for f in fields:
         path = (*_prefix, f.name)
+        json_key = f.physical_name or f.name
         if isinstance(f.type, StructType):
             child_stats = ParsedStats(
                 num_records=stats.num_records if stats else None,
-                min_values=min_values.get(f.name) or {},
-                max_values=max_values.get(f.name) or {},
-                null_count=null_counts.get(f.name) or {},
+                min_values=min_values.get(json_key) or {},
+                max_values=max_values.get(json_key) or {},
+                null_count=null_counts.get(json_key) or {},
             )
             yield from iter_leaf_column_stats(f.type.fields, child_stats, path)
         elif isinstance(f.type, PrimitiveType):
             yield LeafColumnStats(
                 path=path,
                 delta_type=f.type.name,
-                min_value=min_values.get(f.name),
-                max_value=max_values.get(f.name),
-                null_count=null_counts.get(f.name),
+                min_value=min_values.get(json_key),
+                max_value=max_values.get(json_key),
+                null_count=null_counts.get(json_key),
             )
         # ArrayType / MapType: Delta collects no stats for these, nothing to yield.
 

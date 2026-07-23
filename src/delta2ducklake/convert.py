@@ -30,6 +30,14 @@ def _hash_schema_string(schema_string: str) -> str:
     return hashlib.sha256(schema_string.encode("utf-8")).hexdigest()
 
 
+def _partition_physical_names(schema_tree, partition_columns: list[str]) -> list[str]:
+    """Resolve each logical partition column name to its physical Parquet field name (identical
+    to the logical name unless column mapping is on), in the same order as `partition_columns`.
+    """
+    by_name = {f.name: f for f in schema_tree.fields}
+    return [(by_name[name].physical_name or name) for name in partition_columns]
+
+
 def _write_bookkeeping(
     catalog, table_id: int, delta_table_root: str, version: int, schema_hash: str
 ) -> None:
@@ -70,8 +78,13 @@ def copy_table(
     `sync_table()` to update an existing one instead. Returns the new `table_id`.
     """
     storage = get_storage_backend(delta_table_root)
-    state = load_table_state(storage, delta_table_root, end_version=end_version)
+    state = load_table_state(
+        storage, delta_table_root, end_version=end_version, allow_column_mapping=True
+    )
     schema_tree = parse_schema_string(state.metadata.schema_string)
+    partition_physical_names = _partition_physical_names(
+        schema_tree, state.metadata.partition_columns
+    )
 
     catalog = catalog_config.connect()
     try:
@@ -136,7 +149,7 @@ def copy_table(
 
             if partition_id is not None:
                 w.insert_file_partition_values(
-                    catalog, data_file_id, table_id, add, state.metadata.partition_columns
+                    catalog, data_file_id, table_id, add, partition_physical_names
                 )
 
             total_records += record_count
@@ -182,8 +195,13 @@ def sync_table(
     schema evolution during sync is not yet supported.
     """
     storage = get_storage_backend(delta_table_root)
-    state = load_table_state(storage, delta_table_root, end_version=end_version)
+    state = load_table_state(
+        storage, delta_table_root, end_version=end_version, allow_column_mapping=True
+    )
     schema_tree = parse_schema_string(state.metadata.schema_string)
+    partition_physical_names = _partition_physical_names(
+        schema_tree, state.metadata.partition_columns
+    )
 
     catalog = catalog_config.connect()
     try:
@@ -304,7 +322,7 @@ def sync_table(
 
             if partition_id is not None:
                 w.insert_file_partition_values(
-                    catalog, data_file_id, table_id, add, state.metadata.partition_columns
+                    catalog, data_file_id, table_id, add, partition_physical_names
                 )
 
             added_records += record_count

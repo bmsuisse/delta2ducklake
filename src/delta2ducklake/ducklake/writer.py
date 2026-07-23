@@ -114,7 +114,7 @@ def flatten_schema(
     """
     result: list[FlattenedColumn] = []
     for order, f in enumerate(fields):
-        _flatten_node(f.name, f.type, f.nullable, order, alloc, None, (), result)
+        _flatten_node(f.name, f.type, f.nullable, order, alloc, None, (), result, f.physical_name)
     return result
 
 
@@ -127,6 +127,7 @@ def _flatten_node(
     parent_column_id: int | None,
     path: tuple[str, ...],
     out: list[FlattenedColumn],
+    physical_name: str | None = None,
 ) -> None:
     column_id = alloc.alloc_catalog_id()
     child_path = (*path, name)
@@ -139,12 +140,19 @@ def _flatten_node(
             ducklake_type=ducklake_column_type(delta_type),
             nulls_allowed=nullable,
             parent_column_id=parent_column_id,
+            physical_name=physical_name,
         )
     )
     if isinstance(delta_type, StructType):
         for order, f in enumerate(delta_type.fields):
-            _flatten_node(f.name, f.type, f.nullable, order, alloc, column_id, child_path, out)
+            _flatten_node(
+                f.name, f.type, f.nullable, order, alloc, column_id, child_path, out,
+                f.physical_name,
+            )
     elif isinstance(delta_type, ArrayType):
+        # Delta's column mapping never applies to list elements individually -- Parquet's
+        # conventional "element" name is used regardless of columnMapping.mode, so there's no
+        # separate physical name to carry here.
         _flatten_node(
             "element", delta_type.element_type, delta_type.contains_null, 0, alloc, column_id,
             child_path, out,
@@ -240,6 +248,11 @@ def create_name_mapping(
     them back, even though `struct`/`list` columns happened to read back fine without it -- adding
     the mapping fixed it. Applied unconditionally to every table (harmless for already-simple
     schemas) rather than only when a `map` column is present, to keep behavior uniform.
+
+    `source_name` is `c.physical_name` when set (Delta `columnMapping.mode = name`/`id`: the
+    Parquet field's real on-disk name differs from the logical `ducklake_column.column_name`),
+    else `c.name` -- the physical and logical names are identical for a plain
+    `columnMapping.mode = none` table, which is the common case this mapping exists for anyway.
     """
     mapping_id = alloc.alloc_catalog_id()
     catalog.execute(
@@ -255,7 +268,7 @@ def create_name_mapping(
             (
                 mapping_id,
                 c.column_id,
-                c.name,
+                c.physical_name or c.name,
                 c.column_id,
                 c.parent_column_id,
                 len(c.path) == 1 and c.name in partition_columns,
@@ -311,14 +324,19 @@ def insert_file_partition_values(
     data_file_id: int,
     table_id: int,
     add: AddAction,
-    partition_columns: list[str],
+    partition_physical_names: list[str],
 ) -> None:
+    """`partition_physical_names` must be in the same order as Delta's `partitionColumns` and
+    already resolved to *physical* names -- `add.partitionValues` is keyed by physical name under
+    column mapping (confirmed against the real `table_with_column_mapping` fixture), identical to
+    the logical name for a plain `columnMapping.mode = none` table.
+    """
     catalog.executemany(
         "INSERT INTO ducklake_file_partition_value "
         "(data_file_id, table_id, partition_key_index, partition_value) VALUES (?, ?, ?, ?)",
         [
             (data_file_id, table_id, idx, add.partition_values.get(name))
-            for idx, name in enumerate(partition_columns)
+            for idx, name in enumerate(partition_physical_names)
         ],
     )
 

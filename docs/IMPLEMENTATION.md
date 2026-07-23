@@ -393,3 +393,66 @@ values`' 12-level nested Hive path (one level being a colon-containing timestamp
 connection and no ducklake catalog involved at all, so it's DuckDB's `delta` extension, not this
 project; row *count* is still checked for that fixture, and partitioning logic itself has its own
 dedicated non-DuckDB unit test.
+
+## Phase 2 — column mapping
+
+Delta's `columnMapping.mode = name`/`id` means the *physical* Parquet field name differs from the
+*logical* column name a query uses — e.g. a real Databricks-written field named `"Company Very
+Short"` physically stored as `col-173b4db9-b5ad-427f-9e75-516aae37fbbb` (confirmed against the real
+vendored `table_with_column_mapping` fixture, and its own `delta.columnMapping.physicalName` field
+metadata, already captured on `StructField.physical_name` by `delta/schema.py` back in phase 1).
+
+Given phase 1 already required a `map_by_name` `ducklake_column_mapping` unconditionally for every
+table (see the phase-1 writeup above — Bug 3), phase 2 turned out to be a small, targeted change
+rather than a new mechanism: everywhere a value needs to be looked up by the Parquet field's *real*
+on-disk name rather than the logical name a query sees, swap in `physical_name or name`:
+
+- `delta/stats.py::iter_leaf_column_stats` looks up `minValues`/`maxValues`/`nullCount` from
+  `add.stats` by `f.physical_name or f.name` instead of always `f.name` (`LeafColumnStats.path`
+  itself stays logical-name-keyed throughout, since that's what resolves to `column_id` — only the
+  *JSON key* used to pull the raw value out of Delta's stats needs the physical name).
+- `ducklake/writer.py::create_name_mapping`'s `source_name` is `c.physical_name or c.name` (was
+  unconditionally `c.name`) — `FlattenedColumn` grew a `physical_name` field, threaded through
+  `flatten_schema`'s recursion from each `StructField.physical_name` (synthetic `list`/`map`
+  children — `"element"`/`"key"`/`"value"` — never have one of their own: Delta's column mapping
+  never renames array elements or map keys/values individually, so the Parquet convention name is
+  used regardless of mapping mode).
+- `convert.py::_partition_physical_names` resolves each logical partition column name to its
+  physical Parquet field name once per `copy_table()`/`sync_table()` call, since `add.partitionValues`
+  is keyed by physical name too (same fixture, confirmed).
+- `load_table_state(..., allow_column_mapping=True)` is now the default inside `copy_table()`/
+  `sync_table()` — the phase-1 `UnsupportedTableFeatureError` guard in `delta/state.py` stays as
+  written (still gates on `allow_deletion_vectors` for phase 3), it's just no longer tripped by
+  column mapping specifically.
+
+Verified against two real fixtures: `table_with_column_mapping` (delta-rs, mode=`name`, partitioned,
+real Databricks-written stats/partition values) via direct SQL inspection — confirmed
+`ducklake_column.column_name` stays logical ("Company Very Short") while
+`ducklake_name_mapping.source_name` is the physical UUID name, partition values resolve to the
+correct `"BMS"`/`"BME"` strings (not garbage from a logical-name lookup miss), and per-column stats
+land on the right `column_id` despite being keyed by physical name in the source JSON. And, more
+thoroughly, `table-with-columnmapping-mode-name` / `-mode-id` (delta-io, unpartitioned but with a
+genuinely complex nested schema — `map_of_maps`, `struct_of_arrays_maps_of_structs`,
+`array_of_map_of_arrays`) both match `delta_scan` **byte-for-byte** through the real DuckDB
+`ducklake` extension (0 rows either direction via `EXCEPT`), added to `test_verify_duckdb.py`.
+
+**A real, separate limitation found along the way (not a column-mapping bug, but surfaced while
+testing one): DuckDB's own `ducklake` reader requires Hive-style directory paths to materialize
+partition column values, no matter what's in `ducklake_file_partition_value`.** Discovered when
+`table_with_column_mapping` (real Databricks output, physically laid out with opaque directory
+names — `BH/`, `8v/` — instead of the usual `col=value/` convention) failed reading *any* column,
+not just the partition one, with `Column "..." should have been read from hive partitions - but it
+was not found in filename`. This means `ducklake_file_partition_value` — despite being, per its own
+spec, the *authoritative* record of a file's partition values — is not actually consulted by the
+real reader for that purpose; it parses the Hive path segment itself instead. For a table whose
+physical layout doesn't follow that convention, there is no correct catalog metadata that fixes
+this without physically rewriting the files (moving them into `col=value/` directories), which
+would violate the core "never copy or rewrite the data" principle of this whole project. This
+table's *catalog* correctness (name mapping, partition values, stats — all independently confirmed
+correct via direct SQL above) is real; what's not achievable is reading it back through DuckDB's
+`ducklake` extension specifically, given its physical layout. Separately, this also explained a
+second failure on `data-reader-timestamp_ntz-name-mode` (Hive-style, physical name in path, but one
+partition value contains a colon): the *same* double-percent-encoding quirk already documented above
+for `delta_scan` also affects the `ducklake` reader's own Hive-path parsing — confirming it's a
+shared, pre-existing DuckDB-side encoding issue with colon-containing Hive partition values, not
+something introduced by column mapping or specific to one extension.

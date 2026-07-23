@@ -22,12 +22,13 @@ class FlattenedColumn:
     """One row destined for `ducklake_column`, produced by flattening a Delta schema tree."""
 
     column_id: int
-    path: tuple[str, ...]  # e.g. ("a", "ac", "aca") for a nested struct field
-    name: str
+    path: tuple[str, ...]  # e.g. ("a", "ac", "aca") for a nested struct field -- logical names
+    name: str  # logical column name (what ducklake_column.column_name / SQL queries use)
     column_order: int
     ducklake_type: str  # e.g. "int64", "struct", "list", "map" -- container types have no stats
     nulls_allowed: bool
     parent_column_id: int | None
+    physical_name: str | None = None  # Parquet field name, only when it differs from `name`
 
 
 class IdAllocator:
