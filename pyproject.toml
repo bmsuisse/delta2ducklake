@@ -1,0 +1,46 @@
+[project]
+name = "delta2ducklake"
+version = "0.1.0"
+description = "Register Delta Lake tables into a DuckLake catalog without copying the underlying Parquet data"
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "Adrian Ehrsam", email = "adrian.ehrsam@bmsuisse.ch" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "duckdb>=1.5.5",
+    "psycopg[binary]>=3.3.4",
+    "sqlglot>=30.13.0",
+]
+
+[project.optional-dependencies]
+azure = [
+    "azure-storage-blob>=12.30.0",
+    "azure-storage-file-datalake>=12.25.0",
+]
+
+[project.scripts]
+delta2ducklake = "delta2ducklake.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11.30,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "deltalake>=1.6.2",
+    "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.15.22",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
