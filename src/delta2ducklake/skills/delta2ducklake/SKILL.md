@@ -29,7 +29,22 @@ Two entry points cover the whole lifecycle:
   was registered — schema evolution during sync isn't supported yet.
 
 Neither ever touches the Delta table's own files or `_delta_log` — only the DuckLake catalog is
-written to.
+written to, with one opt-in exception: see `materialize_partitions` below.
+
+## Partitioned + column-mapped tables (common on Databricks/Unity Catalog)
+
+Enabling Delta column mapping on a *partitioned* table makes Databricks replace its Hive-style
+`column=value/` partition directories with opaque, unparseable names. DuckDB's own `ducklake`
+reader needs that Hive-style layout to reconstruct partition values — it doesn't consult
+delta2ducklake's catalog metadata for this — so by default `copy_table`/`sync_table` raise
+`PartitionLayoutError` for such a table rather than register one DuckDB can't actually read back.
+
+Pass `materialize_partitions="auto"` (copy affected files into the catalog's own `data_path`) or a
+directory/URL (copy them there instead) to work around it — this makes one real, byte-for-byte
+copy of each affected Parquet file into a genuine Hive layout this project builds itself. It's the
+one deliberate exception to "never copy the data," so only reach for it when a table actually hits
+this failure mode (unpartitioned tables and already-Hive-style layouts are never copied, regardless
+of this argument).
 
 ## Install
 
@@ -150,3 +165,6 @@ delta2ducklake refresh-stats --catalog duckdb:./catalog.ducklake --table my_tabl
       it belongs in delta2ducklake
 - [ ] Quack (`QuackCatalogConfig`) not used for `copy_table`/`sync_table` — bootstrap/read-only only
 - [ ] `refresh_stats()` used to backfill columns Delta itself never collected stats for
+- [ ] If `copy_table`/`sync_table` raises `PartitionLayoutError`, that's a partitioned +
+      column-mapped Databricks table — pass `materialize_partitions="auto"` (or a directory)
+      rather than working around it another way

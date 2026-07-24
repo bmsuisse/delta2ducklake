@@ -6,6 +6,7 @@ from delta2ducklake.cli import main
 from delta2ducklake.ducklake.catalog import SQLiteCatalogConfig
 
 FIXTURES = Path(__file__).parent / "fixtures" / "delta-io"
+DELTA_RS_FIXTURES = Path(__file__).parent / "fixtures" / "delta-rs"
 
 
 def test_bootstrap_copy_and_refresh_stats(tmp_path, capsys):
@@ -97,6 +98,41 @@ def test_bootstrap_and_copy_with_duckdb_catalog(tmp_path, capsys):
         main(["copy", table_root, "--catalog", catalog_arg, "--table", "all_types"]) == 0
     )
     assert "Registered main.all_types" in capsys.readouterr().out
+
+
+def test_copy_reports_error_for_opaque_partition_layout_without_flag(tmp_path, capsys):
+    catalog_path = tmp_path / "catalog.db"
+    data_path = str(tmp_path / "data") + "/"
+    table_root = str(DELTA_RS_FIXTURES / "table_with_column_mapping")
+    catalog_arg = f"sqlite:{catalog_path}"
+
+    main(["bootstrap", "--catalog", catalog_arg, "--data-path", data_path])
+    capsys.readouterr()
+
+    exit_code = main(["copy", table_root, "--catalog", catalog_arg, "--table", "cm"])
+    assert exit_code == 1
+    assert "materialize_partitions" in capsys.readouterr().err
+
+
+def test_copy_with_materialize_partitions_flag_succeeds(tmp_path, capsys):
+    catalog_path = tmp_path / "catalog.db"
+    data_path = str(tmp_path / "data") + "/"
+    table_root = str(DELTA_RS_FIXTURES / "table_with_column_mapping")
+    catalog_arg = f"sqlite:{catalog_path}"
+
+    main(["bootstrap", "--catalog", catalog_arg, "--data-path", data_path])
+    capsys.readouterr()
+
+    exit_code = main(
+        [
+            "copy", table_root,
+            "--catalog", catalog_arg,
+            "--table", "cm",
+            "--materialize-partitions", "auto",
+        ]
+    )
+    assert exit_code == 0
+    assert "Registered main.cm" in capsys.readouterr().out
 
 
 def test_invalid_catalog_spec_errors():

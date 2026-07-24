@@ -363,7 +363,16 @@ def insert_data_file(
     row_id_start: int,
     partition_id: int | None,
     mapping_id: int,
+    *,
+    path_override: str | None = None,
 ) -> None:
+    """`path_override`, when given, replaces `add.path` and is stored as an *absolute*
+    (`path_is_relative = False`) location instead of Delta's own relative path -- used when the
+    source file was materialized into a Hive-style copy under DuckLake's own storage (see
+    `convert.py::_materialize_partitioned_file`) rather than registered in place.
+    """
+    path = add.path if path_override is None else path_override
+    path_is_relative = path_override is None
     catalog.execute(
         "INSERT INTO ducklake_data_file "
         "(data_file_id, table_id, begin_snapshot, end_snapshot, file_order, path, "
@@ -375,8 +384,8 @@ def insert_data_file(
             table_id,
             snapshot_id,
             data_file_id,  # file_order: any value unique-within-snapshot works; file_id serves fine
-            add.path,
-            True,
+            path,
+            path_is_relative,
             record_count,
             add.size,
             row_id_start,

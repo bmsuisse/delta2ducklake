@@ -455,16 +455,44 @@ was not found in filename`. This means `ducklake_file_partition_value` — despi
 spec, the *authoritative* record of a file's partition values — is not actually consulted by the
 real reader for that purpose; it parses the Hive path segment itself instead. For a table whose
 physical layout doesn't follow that convention, there is no correct catalog metadata that fixes
-this without physically rewriting the files (moving them into `col=value/` directories), which
-would violate the core "never copy or rewrite the data" principle of this whole project. This
-table's *catalog* correctness (name mapping, partition values, stats — all independently confirmed
-correct via direct SQL above) is real; what's not achievable is reading it back through DuckDB's
-`ducklake` extension specifically, given its physical layout. Separately, this also explained a
-second failure on `data-reader-timestamp_ntz-name-mode` (Hive-style, physical name in path, but one
-partition value contains a colon): the *same* double-percent-encoding quirk already documented above
-for `delta_scan` also affects the `ducklake` reader's own Hive-path parsing — confirming it's a
-shared, pre-existing DuckDB-side encoding issue with colon-containing Hive partition values, not
-something introduced by column mapping or specific to one extension.
+this without physically relocating the files (moving them into `col=value/` directories) -- so by
+default `copy_table()`/`sync_table()` refuse such a table outright (`PartitionLayoutError`) rather
+than register a catalog DuckDB can't actually read back. This table's *catalog* correctness (name
+mapping, partition values, stats — all independently confirmed correct via direct SQL above) is
+real; what wasn't achievable, until `materialize_partitions` below, was reading it back through
+DuckDB's `ducklake` extension specifically, given its physical layout. Separately, this also
+explained a second failure on `data-reader-timestamp_ntz-name-mode` (Hive-style, physical name in
+path, but one partition value contains a colon): the *same* double-percent-encoding quirk already
+documented above for `delta_scan` also affects the `ducklake` reader's own Hive-path parsing --
+confirming it's a shared, pre-existing DuckDB-side encoding issue with colon-containing Hive
+partition values, not something introduced by column mapping or specific to one extension.
+
+**`materialize_partitions`: the one deliberate, opt-in exception to "never copy or rewrite the
+data."** `delta.partition_layout.is_hive_style_layout` checks each file's own path against its
+partition columns' physical names (`name=` prefix only, not exact-value match -- replicating
+Delta's own escaping byte-for-byte isn't needed just to detect the opaque-directory failure mode).
+When that check fails and the caller passed `materialize_partitions="auto"` (copy into the DuckLake
+catalog's own `data_path`) or a directory/URI (copy there instead), `convert._materialize_partitioned_file`
+copies the file's bytes verbatim into a *new*, genuine `physical_name=value/.../file.parquet` Hive
+path it builds itself (`delta.partition_layout.hive_path_segments`), and that copy's absolute path
+is what gets registered in `ducklake_data_file` (`path_is_relative = False`) instead of the source's
+own path. `encode_hive_value` replicates Delta/Hive's own on-disk escaping (percent-encode
+everything except a literal space -- confirmed against `data-reader-partition-values`'s real
+`as_timestamp=2021-09-08 11%3A11%3A11` folder name) rather than inventing a new scheme, since that's
+the exact encoding already proven to round-trip through the real `ducklake` reader. Verified
+end-to-end (not just "the catalog rows look right"): `test_materialize_partitions_readable_through_real_ducklake_extension`
+in `test_verify_duckdb.py` attaches the resulting catalog with real DuckDB and matches it row-for-row
+against `delta_scan` on `table_with_column_mapping` -- proof DuckDB's own Hive-partition decoder
+actually accepts this project's encoding, not an assumption.
+
+Two things this does *not* solve, left as known scope boundaries (consistent with delete files,
+which have the same gap already): materialized copies are never cleaned up when their source file
+is later retired by `sync_table` (they just become orphaned bytes under the destination, same as a
+superseded delete file already is -- no vacuum exists for either yet), and a materialized file's
+original Delta path is tracked in `ducklake_metadata` (key `delta2ducklake.materialized_paths`,
+JSON-encoded per table) purely so `sync_table`'s active-file diffing keeps recognizing it as
+unchanged -- without that translation, every materialized file would look removed-and-re-added (and
+get needlessly re-copied) on every single sync.
 
 ## Phase 3 — deletion vectors
 

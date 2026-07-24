@@ -85,6 +85,19 @@ def _add_table_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--schema", default="main", help="DuckLake schema name (default: main)")
 
 
+def _add_materialize_partitions_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--materialize-partitions",
+        default=None,
+        metavar="auto|<directory>",
+        help="Work around a partitioned table whose on-disk directory layout isn't 'column=value' "
+        "Hive style (happens when Delta column mapping is enabled, common on Databricks/Unity "
+        "Catalog): 'auto' copies affected files into the catalog's own data_path, or pass a "
+        "directory/URL to copy them there instead. Omit to fail with a clear error instead "
+        "(the default) rather than register a table DuckDB can't actually read back.",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="delta2ducklake",
@@ -112,6 +125,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--version", type=int, default=None, metavar="N",
         help="Delta version to copy (default: latest)",
     )
+    _add_materialize_partitions_arg(copy_parser)
 
     sync_parser = subparsers.add_parser(
         "sync",
@@ -127,6 +141,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--version", type=int, default=None, metavar="N",
         help="Delta version to sync to (default: latest)",
     )
+    _add_materialize_partitions_arg(sync_parser)
 
     stats_parser = subparsers.add_parser(
         "refresh-stats", help="(Re)compute stats for some or all columns of a DuckLake table"
@@ -152,12 +167,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             table_id = copy_table(
                 args.delta_table_root, catalog, args.table,
                 schema_name=args.schema, end_version=args.version,
+                materialize_partitions=args.materialize_partitions,
             )
             print(f"Registered {args.schema}.{args.table} (table_id={table_id})")
         elif args.command == "sync":
             table_id = sync_table(
                 args.delta_table_root, catalog, args.table,
                 schema_name=args.schema, end_version=args.version,
+                materialize_partitions=args.materialize_partitions,
             )
             print(f"Synced {args.schema}.{args.table} (table_id={table_id})")
         elif args.command == "refresh-stats":

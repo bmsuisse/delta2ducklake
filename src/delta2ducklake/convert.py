@@ -8,9 +8,15 @@ never silently re-run as a side effect of a copy/sync call.
 from __future__ import annotations
 
 import hashlib
+import json
 import uuid
 
 from delta2ducklake.delta.deletion_vector import deleted_row_positions
+from delta2ducklake.delta.partition_layout import (
+    PartitionLayoutError,
+    hive_path_segments,
+    is_hive_style_layout,
+)
 from delta2ducklake.delta.schema import parse_schema_string
 from delta2ducklake.delta.state import load_table_state, touched_paths_since
 from delta2ducklake.delta.stats import (
@@ -26,6 +32,7 @@ from delta2ducklake.storage import get_storage_backend, to_duckdb_uri
 SOURCE_PATH_KEY = "delta2ducklake.source_path"
 SOURCE_VERSION_KEY = "delta2ducklake.source_version"
 SCHEMA_HASH_KEY = "delta2ducklake.schema_hash"
+MATERIALIZED_PATHS_KEY = "delta2ducklake.materialized_paths"
 
 
 def _hash_schema_string(schema_string: str) -> str:
@@ -40,6 +47,114 @@ def _partition_physical_names(schema_tree, partition_columns: list[str]) -> list
     return [(by_name[name].physical_name or name) for name in partition_columns]
 
 
+def _ducklake_managed_path(root: str, schema_name: str, table_name: str, *parts: str) -> str:
+    """Build a path under DuckLake-managed storage (the catalog's own `data_path`, or a custom
+    `materialize_partitions` destination), namespaced by schema/table to avoid collisions with
+    other tables sharing the same root."""
+    base = f"{root.rstrip('/')}/{schema_name}/{table_name}"
+    joined = "/".join(parts)
+    return f"{base}/{joined}" if joined else base
+
+
+def _validate_materialize_destination(materialize_partitions: str, delta_table_root: str) -> None:
+    """Refuse a custom `materialize_partitions` destination that overlaps the source Delta table
+    root -- materialized copies must never land back inside the table being read, even under a
+    subdirectory. Not applied to `"auto"` (the DuckLake catalog's own `data_path`), which by
+    construction is never the source Delta table's own directory.
+    """
+    dest = materialize_partitions.rstrip("/") + "/"
+    source = delta_table_root.rstrip("/") + "/"
+    if dest.startswith(source) or source.startswith(dest):
+        raise ValueError(
+            f"materialize_partitions destination {materialize_partitions!r} overlaps the source "
+            f"Delta table root {delta_table_root!r} -- materialized copies must never be written "
+            "back into the table being read. Point materialize_partitions at a separate location, "
+            "or pass 'auto' to write into the DuckLake catalog's own data_path instead."
+        )
+
+
+def _resolve_materialize_dest(
+    materialize_partitions: str | None, delta_table_root: str, ducklake_data_path: str,
+    credential=None,
+) -> tuple[str, object] | None:
+    """`None` if materialization is off; otherwise `(dest_root, dest_storage)`, resolved and built
+    once per `copy_table()`/`sync_table()` call rather than once per file.
+    """
+    if materialize_partitions is None:
+        return None
+    if materialize_partitions == "auto":
+        dest_root = ducklake_data_path
+    else:
+        _validate_materialize_destination(materialize_partitions, delta_table_root)
+        dest_root = materialize_partitions
+    return dest_root, get_storage_backend(dest_root, credential=credential)
+
+
+def _materialize_partitioned_file(
+    storage,
+    delta_table_root: str,
+    add,
+    partition_physical_names: list[str],
+    dest_root: str,
+    dest_storage,
+    schema_name: str,
+    table_name: str,
+) -> str:
+    """Copy `add`'s Parquet bytes, byte-for-byte, into `dest_root` laid out as a genuine
+    `physical_name=value/.../file.parquet` Hive path -- a destination DuckDB's `ducklake` reader can
+    actually parse partition values out of, unlike the source table's own (column-mapping-
+    obfuscated) directory layout. Only reached when `materialize_partitions` opts into it;
+    otherwise this project never copies or rewrites the source data.
+
+    The destination file name reuses the source's own (Delta-guaranteed-unique) basename rather
+    than a freshly generated one, so re-materializing the same source file -- e.g. retrying a
+    `copy_table()`/`sync_table()` call after a mid-loop failure -- overwrites the same copy instead
+    of accumulating an orphaned one on every attempt.
+    """
+    source_path = storage.resolve(delta_table_root, add.path)
+    data = storage.read_bytes(source_path)
+
+    segments = hive_path_segments(partition_physical_names, add.partition_values)
+    basename = add.path.rsplit("/", 1)[-1]
+    dest_path = _ducklake_managed_path(dest_root, schema_name, table_name, *segments, basename)
+
+    dest_storage.write_bytes(dest_path, data)
+    return dest_path
+
+
+def _resolve_data_file_path_override(
+    storage,
+    delta_table_root: str,
+    add,
+    partition_id: int | None,
+    partition_physical_names: list[str],
+    materialize_dest: tuple[str, object] | None,
+    schema_name: str,
+    table_name: str,
+) -> str | None:
+    """`None` if `add` can be registered in place (unpartitioned, or already a genuine Hive
+    `column=value` layout); otherwise either raises `PartitionLayoutError` (no
+    `materialize_partitions` destination given) or returns the materialized copy's path.
+    """
+    if partition_id is None or is_hive_style_layout(add.path, partition_physical_names):
+        return None
+    if materialize_dest is None:
+        raise PartitionLayoutError(
+            f"{delta_table_root!r}: partition directory layout for {add.path!r} doesn't follow "
+            "the `column=value` Hive convention DuckDB's `ducklake` reader requires to "
+            "reconstruct partition values -- this happens when Delta column mapping is enabled "
+            "on a partitioned table (Databricks then uses opaque directory names instead of "
+            "column=value). Pass materialize_partitions='auto' (or a directory path) to "
+            "copy_table()/sync_table() to copy affected files into a Hive-style layout under "
+            "DuckLake's own storage instead, without touching the source table."
+        )
+    dest_root, dest_storage = materialize_dest
+    return _materialize_partitioned_file(
+        storage, delta_table_root, add, partition_physical_names, dest_root, dest_storage,
+        schema_name, table_name,
+    )
+
+
 def _register_deletion_vector(
     catalog,
     alloc: IdAllocator,
@@ -51,22 +166,28 @@ def _register_deletion_vector(
     storage,
     delta_table_root: str,
     add,
+    matched_file_path: str,
     ducklake_data_path: str,
     credential=None,
 ) -> None:
     """Resolve a Delta deletion vector into row positions, write a DuckLake positional-delete
     Parquet file for it, and register it against `data_file_id`.
 
-    The delete file is written into the DuckLake catalog's own managed `data_path` -- never into
-    the Delta table's own directory, consistent with this project only ever *reading* from there.
+    `matched_file_path` must be the exact location `ducklake_data_file.path` was registered with
+    for this file (DuckLake matches a delete file's positions to its data file by this path) --
+    the source table's own resolved path normally, but the materialized copy's path instead for a
+    file `materialize_partitions` relocated (see `_resolve_data_file_path_override`).
+
+    The delete file itself is written into the DuckLake catalog's own managed `data_path` -- never
+    into the Delta table's own directory, consistent with this project only ever *reading* from
+    there (materialized data-file copies are the one deliberate, opt-in exception).
     """
     positions = deleted_row_positions(add.deletion_vector, storage, delta_table_root)
-    matched_file_path = storage.resolve(delta_table_root, add.path)
     parquet_bytes = w.build_positional_delete_parquet(matched_file_path, positions)
 
     ducklake_storage = get_storage_backend(ducklake_data_path, credential=credential)
-    dest_path = (
-        f"{ducklake_data_path.rstrip('/')}/{schema_name}/{table_name}/{uuid.uuid4()}-delete.parquet"
+    dest_path = _ducklake_managed_path(
+        ducklake_data_path, schema_name, table_name, f"{uuid.uuid4()}-delete.parquet"
     )
     ducklake_storage.write_bytes(dest_path, parquet_bytes)
 
@@ -77,31 +198,98 @@ def _register_deletion_vector(
     )
 
 
+def _finalize_data_file(
+    catalog,
+    alloc: IdAllocator,
+    schema_name: str,
+    table_name: str,
+    snapshot_id: int,
+    table_id: int,
+    data_file_id: int,
+    storage,
+    delta_table_root: str,
+    add,
+    path_override: str | None,
+    materialized_paths: dict[str, str],
+    ducklake_data_path: str,
+    credential=None,
+) -> None:
+    """Shared tail of the per-file loop in both `copy_table()` and `sync_table()`: record a
+    materialized file's original Delta path (so `sync_table()`'s active-file diffing keeps
+    recognizing it as unchanged instead of re-copying it every sync) and register any deletion
+    vector against the file's actual registered location -- the materialized copy's path if
+    `path_override` is set, else the source's own resolved path.
+    """
+    if path_override is not None:
+        materialized_paths[add.path] = path_override
+    if add.deletion_vector is not None:
+        matched_file_path = path_override or storage.resolve(delta_table_root, add.path)
+        _register_deletion_vector(
+            catalog, alloc, schema_name, table_name, snapshot_id, table_id, data_file_id, storage,
+            delta_table_root, add, matched_file_path, ducklake_data_path, credential=credential,
+        )
+
+
+def _read_metadata_keys(catalog, table_id: int, keys: tuple[str, ...]) -> dict[str, str]:
+    placeholders = ", ".join("?" for _ in keys)
+    rows = catalog.fetchall(
+        f"SELECT key, value FROM ducklake_metadata WHERE scope = 'table' AND scope_id = ? "
+        f"AND key IN ({placeholders})",
+        (table_id, *keys),
+    )
+    return dict(rows)
+
+
+def _write_metadata_keys(
+    catalog, table_id: int, keys_to_clear: tuple[str, ...], values: dict[str, str]
+) -> None:
+    """Delete any existing rows for `keys_to_clear`, then insert `values` (a subset of, or equal
+    to, `keys_to_clear`) -- the delete-then-insert pattern shared by every per-table metadata key
+    this module writes."""
+    placeholders = ", ".join("?" for _ in keys_to_clear)
+    catalog.execute(
+        f"DELETE FROM ducklake_metadata WHERE scope = 'table' AND scope_id = ? "
+        f"AND key IN ({placeholders})",
+        (table_id, *keys_to_clear),
+    )
+    if values:
+        catalog.executemany(
+            "INSERT INTO ducklake_metadata (key, value, scope, scope_id) VALUES (?, ?, 'table', ?)",
+            [(key, value, table_id) for key, value in values.items()],
+        )
+
+
 def _write_bookkeeping(
     catalog, table_id: int, delta_table_root: str, version: int, schema_hash: str
 ) -> None:
-    catalog.execute(
-        "DELETE FROM ducklake_metadata WHERE scope = 'table' AND scope_id = ? "
-        "AND key IN (?, ?, ?)",
-        (table_id, SOURCE_PATH_KEY, SOURCE_VERSION_KEY, SCHEMA_HASH_KEY),
-    )
-    catalog.executemany(
-        "INSERT INTO ducklake_metadata (key, value, scope, scope_id) VALUES (?, ?, 'table', ?)",
-        [
-            (SOURCE_PATH_KEY, delta_table_root, table_id),
-            (SOURCE_VERSION_KEY, str(version), table_id),
-            (SCHEMA_HASH_KEY, schema_hash, table_id),
-        ],
-    )
+    values = {
+        SOURCE_PATH_KEY: delta_table_root,
+        SOURCE_VERSION_KEY: str(version),
+        SCHEMA_HASH_KEY: schema_hash,
+    }
+    _write_metadata_keys(catalog, table_id, tuple(values), values)
 
 
 def _read_bookkeeping(catalog, table_id: int) -> dict[str, str]:
-    rows = catalog.fetchall(
-        "SELECT key, value FROM ducklake_metadata WHERE scope = 'table' AND scope_id = ? "
-        "AND key IN (?, ?, ?)",
-        (table_id, SOURCE_PATH_KEY, SOURCE_VERSION_KEY, SCHEMA_HASH_KEY),
+    return _read_metadata_keys(
+        catalog, table_id, (SOURCE_PATH_KEY, SOURCE_VERSION_KEY, SCHEMA_HASH_KEY)
     )
-    return dict(rows)
+
+
+def _read_materialized_paths(catalog, table_id: int) -> dict[str, str]:
+    """Delta-relative path -> materialized absolute path, for every file `materialize_partitions`
+    has copied into a Hive-style layout so far. `sync_table` needs this to recognize such a file as
+    still active (its `ducklake_data_file.path` no longer equals its Delta path) and to know which
+    already-resolved path a deletion vector on it must match -- empty for tables with none.
+    """
+    raw = _read_metadata_keys(catalog, table_id, (MATERIALIZED_PATHS_KEY,))
+    value = raw.get(MATERIALIZED_PATHS_KEY)
+    return json.loads(value) if value else {}
+
+
+def _write_materialized_paths(catalog, table_id: int, materialized_paths: dict[str, str]) -> None:
+    values = {MATERIALIZED_PATHS_KEY: json.dumps(materialized_paths)} if materialized_paths else {}
+    _write_metadata_keys(catalog, table_id, (MATERIALIZED_PATHS_KEY,), values)
 
 
 def copy_table(
@@ -112,6 +300,7 @@ def copy_table(
     schema_name: str = "main",
     end_version: int | None = None,
     credential=None,
+    materialize_partitions: str | None = None,
 ) -> int:
     """Register a Delta table's currently-active files (or its state as of `end_version`) into a
     brand-new DuckLake table. Fails if `table_name` already exists in `schema_name` -- call
@@ -121,6 +310,16 @@ def copy_table(
     backend for both reading the Delta table and writing any DuckLake deletion-vector files --
     needed whenever `delta_table_root`/the catalog's `data_path` live on a non-public Azure
     storage account.
+
+    `materialize_partitions` controls what happens if a partitioned table's on-disk directory
+    layout isn't `column=value` Hive style (which happens when Delta column mapping is enabled on
+    Databricks -- see `delta.partition_layout` for why DuckDB's `ducklake` reader can't handle that
+    directly). Left as `None` (the default), this raises `PartitionLayoutError` rather than
+    register a table DuckDB can't actually read back. Pass `"auto"` to instead copy each affected
+    file, byte-for-byte, into a proper Hive layout under the DuckLake catalog's own `data_path`; or
+    a directory path/URI to copy into that location instead (must not overlap `delta_table_root`).
+    Ignored entirely for files that are already Hive-style (or for unpartitioned tables) -- this
+    never copies more than it has to.
     """
     storage = get_storage_backend(delta_table_root, credential=credential)
     state = load_table_state(
@@ -171,20 +370,29 @@ def copy_table(
         }
         accumulators = w.new_column_accumulators(columns, leaf_types)
         ducklake_data_path = w.read_data_path(catalog)
+        materialize_dest = _resolve_materialize_dest(
+            materialize_partitions, delta_table_root, ducklake_data_path, credential=credential
+        )
 
         total_records = 0
         total_bytes = 0
         next_row_id = 0
+        materialized_paths: dict[str, str] = {}
 
         for add in state.active_files.values():
             data_file_id = alloc.alloc_file_id()
             parsed_stats = parse_add_stats(add.stats)
             record_count = _resolve_record_count(storage, delta_table_root, add, parsed_stats)
 
+            path_override = _resolve_data_file_path_override(
+                storage, delta_table_root, add, partition_id, partition_physical_names,
+                materialize_dest, schema_name, table_name,
+            )
+
             row_id_start = next_row_id
             w.insert_data_file(
                 catalog, data_file_id, table_id, new_snapshot_id, add, record_count, row_id_start,
-                partition_id, mapping_id,
+                partition_id, mapping_id, path_override=path_override,
             )
 
             for leaf in iter_leaf_column_stats(schema_tree.fields, parsed_stats):
@@ -199,12 +407,11 @@ def copy_table(
                     catalog, data_file_id, table_id, add, partition_physical_names
                 )
 
-            if add.deletion_vector is not None:
-                _register_deletion_vector(
-                    catalog, alloc, schema_name, table_name, new_snapshot_id, table_id,
-                    data_file_id, storage, delta_table_root, add, ducklake_data_path,
-                    credential=credential,
-                )
+            _finalize_data_file(
+                catalog, alloc, schema_name, table_name, new_snapshot_id, table_id, data_file_id,
+                storage, delta_table_root, add, path_override, materialized_paths,
+                ducklake_data_path, credential=credential,
+            )
 
             total_records += record_count
             total_bytes += add.size
@@ -213,6 +420,8 @@ def copy_table(
         w.insert_table_stats(catalog, table_id, total_records, next_row_id, total_bytes)
         for column_id, agg in accumulators.items():
             w.insert_table_column_stats(catalog, table_id, column_id, agg)
+
+        _write_materialized_paths(catalog, table_id, materialized_paths)
 
         schema_hash = _hash_schema_string(state.metadata.schema_string)
         _write_bookkeeping(catalog, table_id, delta_table_root, state.version, schema_hash)
@@ -239,6 +448,7 @@ def sync_table(
     schema_name: str = "main",
     end_version: int | None = None,
     credential=None,
+    materialize_partitions: str | None = None,
 ) -> int:
     """Bring a DuckLake table up to date with the Delta table's currently-active files (or its
     state as of `end_version`): newly-added files are registered, files no longer active are
@@ -249,6 +459,11 @@ def sync_table(
     copy_table()/sync_table() call has happened. Returns the table_id.
 
     `credential` is forwarded to the storage backend exactly as in `copy_table()`.
+
+    `materialize_partitions` is exactly as in `copy_table()`, applied to newly-added files only --
+    a file already registered as a materialized copy stays associated with its existing copy
+    regardless of this argument (removing/re-materializing it happens automatically only if the
+    Delta table itself removes and re-adds that path).
 
     Raises `NotImplementedError` if the Delta table's schema has changed since it was registered --
     schema evolution during sync is not yet supported.
@@ -277,6 +492,7 @@ def sync_table(
             return copy_table(
                 delta_table_root, catalog_config, table_name,
                 schema_name=schema_name, end_version=end_version, credential=credential,
+                materialize_partitions=materialize_partitions,
             )
 
         bookkeeping = _read_bookkeeping(catalog, table_id)
@@ -297,13 +513,21 @@ def sync_table(
                 "schema evolution during sync_table() is not yet supported"
             )
 
-        existing_files = dict(
-            catalog.fetchall(
+        materialized_paths = _read_materialized_paths(catalog, table_id)
+        materialized_to_delta = {v: k for k, v in materialized_paths.items()}
+
+        # A materialized file's stored `path` is its copy's location, not its Delta path --
+        # translate back so `existing_files` stays keyed by Delta path like `state.active_files`,
+        # otherwise every materialized file would look removed-and-re-added (and get re-copied) on
+        # every sync.
+        existing_files = {
+            materialized_to_delta.get(path, path): data_file_id
+            for path, data_file_id in catalog.fetchall(
                 "SELECT path, data_file_id FROM ducklake_data_file "
                 "WHERE table_id = ? AND end_snapshot IS NULL",
                 (table_id,),
             )
-        )
+        }
         active_now = set(state.active_files)
         previously_active = set(existing_files)
 
@@ -341,6 +565,7 @@ def sync_table(
                     "UPDATE ducklake_data_file SET end_snapshot = ? WHERE data_file_id = ?",
                     (new_snapshot_id, existing_files[path]),
                 )
+                materialized_paths.pop(path, None)
 
         columns = w.load_columns(catalog, table_id, snapshot.snapshot_id)
         path_to_id = w.path_to_column_id(columns)
@@ -365,6 +590,9 @@ def sync_table(
         added_records = 0
         added_bytes = 0
         ducklake_data_path = w.read_data_path(catalog)
+        materialize_dest = _resolve_materialize_dest(
+            materialize_partitions, delta_table_root, ducklake_data_path, credential=credential
+        )
 
         for path in new_paths:
             add = state.active_files[path]
@@ -372,10 +600,15 @@ def sync_table(
             parsed_stats = parse_add_stats(add.stats)
             record_count = _resolve_record_count(storage, delta_table_root, add, parsed_stats)
 
+            path_override = _resolve_data_file_path_override(
+                storage, delta_table_root, add, partition_id, partition_physical_names,
+                materialize_dest, schema_name, table_name,
+            )
+
             row_id_start = next_row_id
             w.insert_data_file(
                 catalog, data_file_id, table_id, new_snapshot_id, add, record_count, row_id_start,
-                partition_id, mapping_id,
+                partition_id, mapping_id, path_override=path_override,
             )
 
             for leaf in iter_leaf_column_stats(schema_tree.fields, parsed_stats):
@@ -390,16 +623,17 @@ def sync_table(
                     catalog, data_file_id, table_id, add, partition_physical_names
                 )
 
-            if add.deletion_vector is not None:
-                _register_deletion_vector(
-                    catalog, alloc, schema_name, table_name, new_snapshot_id, table_id,
-                    data_file_id, storage, delta_table_root, add, ducklake_data_path,
-                    credential=credential,
-                )
+            _finalize_data_file(
+                catalog, alloc, schema_name, table_name, new_snapshot_id, table_id, data_file_id,
+                storage, delta_table_root, add, path_override, materialized_paths,
+                ducklake_data_path, credential=credential,
+            )
 
             added_records += record_count
             added_bytes += add.size
             next_row_id += record_count
+
+        _write_materialized_paths(catalog, table_id, materialized_paths)
 
         w.update_table_stats(
             catalog, table_id,
